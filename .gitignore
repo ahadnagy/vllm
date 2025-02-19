@@ -8,3 +8,7 @@ build/
 
 async_gemm_wide/
 grid_results/
+
+
+*.egg-info/**
+.vscode/

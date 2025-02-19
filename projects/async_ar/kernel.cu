@@ -1,0 +1,299 @@
+#include "./consumer.cu"
+#include "./producer.cu"
+
+#include <rccl/rccl.h>
+#include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+
+#include <torch/extension.h>
+
+
+template<int B_LANES, int A_PRODUCERS, int B_PRODUCERS, int CONSUMERS, int QSIZE>
+void __global__ _tsr_kernel_fused(
+    const fp8* __restrict__ A, 
+    const fp8* __restrict__ B,
+    half* __restrict__ D,
+    const float* scale_tensor,
+    const int m,
+    const int n,
+    const int k,
+    const int split_k,
+    half* partial_results,  // Buffer for partial results
+    int* ready_flags        // Flags to signal when partial results are ready
+) {
+    // Initialize shared queue
+    __shared__ uint8 queue[2 * B_LANES * QSIZE];
+    if (threadIdx.x < 2 * B_LANES * QSIZE) {
+        queue[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    // Declare shared buffer
+    __shared__ fp8 A_buffer[WARPTILE_M * WARPTILE_K * QSIZE];
+    __shared__ fp8 B_buffer[(OP_N * B_LANES) * WARPTILE_K * QSIZE];
+    __syncthreads();
+
+    // Infer index and p-state
+    int role_id;
+    int index;
+    uint8 p_state;
+
+    // A producer warp
+    if (threadIdx.x < A_PRODUCERS * WARPSIZE) {
+        role_id = threadIdx.x / WARPSIZE;
+        index = (OPS == 1 ? 2 : 1) * role_id;
+        p_state = 0;
+    } 
+    // B producer warp
+    else if (threadIdx.x < A_PRODUCERS * WARPSIZE + B_PRODUCERS * WARPSIZE) {
+        role_id = (threadIdx.x / WARPSIZE) - A_PRODUCERS;
+        index = role_id;
+        p_state = 0;
+    }
+    // Consumers warp
+    else {
+        role_id = (threadIdx.x / WARPSIZE) - (A_PRODUCERS + B_PRODUCERS);
+        index = role_id;
+        p_state = 32;
+    }
+
+    // Tiles loop
+    int curr_n, curr_k, k_blocks, dropped_rows, dropped_cols;
+    const int warptile_per_row = CDIV(n, (OP_N * B_LANES));
+    const int tiles = warptile_per_row * split_k;
+    const int tpw = max(CDIV(tiles, CU), 1);
+
+    for (int warptile = (tpw * blockIdx.x); warptile < min(tiles, tpw * (blockIdx.x + 1)); warptile++) {
+
+        // Compute tile position
+        curr_n = (warptile % warptile_per_row) * (OP_N * B_LANES);
+        curr_k = (warptile / warptile_per_row) * WARPTILE_K * K_BLOCKS(k, split_k);
+        k_blocks = ((warptile / warptile_per_row) == (split_k - 1)) ? (k / WARPTILE_K) - (split_k - 1) * K_BLOCKS(k, split_k) : K_BLOCKS(k, split_k);
+
+        // Account for column overflow
+        dropped_rows = max(0, 0      + WARPTILE_M - m);
+        dropped_cols = max(0, curr_n + (OP_N * B_LANES) - n);
+        curr_n -= dropped_cols;
+
+        // A producer warp
+        if (threadIdx.x < A_PRODUCERS * WARPSIZE) {
+            _tsr_A_producer<A_PRODUCERS, B_LANES, QSIZE>(
+                A + curr_k, 
+                &A_buffer[0], 
+                &queue[0],
+                index, p_state, role_id,
+                dropped_rows,
+                k, k_blocks
+            ); 
+        } 
+        // B producer warp
+        else if (threadIdx.x < A_PRODUCERS * WARPSIZE + B_PRODUCERS * WARPSIZE) {
+            _tsr_B_producer<B_PRODUCERS, B_LANES, QSIZE>(
+                B + curr_n * k + curr_k,
+                &B_buffer[0],
+                &queue[1],
+                index, p_state, role_id,
+                k, k_blocks
+            ); 
+        }
+        // Consumers warp
+        else if (threadIdx.x < (A_PRODUCERS + B_PRODUCERS + CONSUMERS) * WARPSIZE) {
+            _tsr_consumer<CONSUMERS, B_LANES, QSIZE>(
+                &A_buffer[0],
+                &B_buffer[0],
+                D + curr_n,
+                scale_tensor[0],
+                &queue[0],
+                index, p_state, role_id,
+                n, 
+                dropped_rows, dropped_cols,
+                k, k_blocks
+            );
+
+            // Store partial results
+            if (threadIdx.x < CONSUMERS * WARPSIZE) {
+                int consumer_id = threadIdx.x / WARPSIZE;
+                int lane_id = threadIdx.x % WARPSIZE;
+                int offset = consumer_id * B_LANES * 8 * OP_N * B_LANES + lane_id * 8 * OP_N * B_LANES;
+                for (int i = 0; i < B_LANES; i++) {
+                    for (int j = 0; j < 8; j++) {
+                        for (int k = 0; k < OP_N * B_LANES; k++) {
+                            partial_results[offset + i * 8 * OP_N * B_LANES + j * OP_N * B_LANES + k] = D[curr_n + i * OP_N * B_LANES + k];
+                        }
+                    }
+                }
+
+                // Signal that partial results are ready
+                if (lane_id == 0) {
+                    atomicAdd(&ready_flags[consumer_id], 1);  // Use atomic operation to set flag
+                }
+            }
+        }
+    }
+}
+
+void fused_gemm_ar(
+    torch::Tensor& A,
+    torch::Tensor& B,
+    torch::Tensor& D,
+    torch::Tensor& scale_tensor,
+    int64_t b_lanes,
+    int64_t split_k,
+    ncclComm_t comm
+) {
+
+    const int m = A.size(0);
+    const int n = B.size(1);
+    const int k = A.size(1);
+    
+    const fp8* __restrict__ A_ = (const fp8* __restrict__) A.data_ptr(); 
+    const fp8* __restrict__ B_ = (const fp8* __restrict__) B.data_ptr(); 
+    half* __restrict__ D_ = (half* __restrict__) D.data_ptr(); 
+    float* __restrict__ scale_tensor_ = (float* __restrict__) scale_tensor.data_ptr(); 
+
+    // Check shape
+    if (m > WARPTILE_M) {
+        std::cerr << "m = " << k << " is greater than WARPTILE_M = " << WARPTILE_M << std::endl;
+        exit(1);
+    }    
+    if (k % WARPTILE_K != 0) {
+        std::cerr << "k = " << k << " is not divisible by WARPTILE_K = " << WARPTILE_K << std::endl;
+        exit(1);
+    }
+
+    // Prepare kernel launch
+    dim3 grid(CU, 1, 1);
+    dim3 block(1, 1, 1);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Allocate memory for partial results and CUDA events
+    half* partial_results;
+    cudaMalloc(&partial_results, CONSUMERS_ * B_LANES_ * WARPTILE_M * OP_N * b_lanes * sizeof(half));
+
+    int* ready_flags;
+    hipMalloc(&ready_flags, 2 * sizeof(int));
+    hipMemset(ready_flags, 0, 2 * sizeof(int));
+
+    int warps = 0;
+    warps += A_PRODUCERS_;
+    warps += B_PRODUCERS_;
+    warps += CONSUMERS_;
+
+    // Launch kernel (branched on B_LANES)
+    switch (b_lanes) {
+        case 2:
+            block.x = WARPSIZE * (4 + 8 + 4);
+            _tsr_kernel_fused<2, 4, 8, 4, 4><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, partial_results, ready_flags);
+            break;
+        case 3:
+            block.x = WARPSIZE * (2 + 6 + 3);
+            _tsr_kernel_fused<3, 2, 6, 3, 3><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, partial_results, ready_flags);
+            break;
+        case 4:
+            block.x = WARPSIZE * (2 + 6 + 3);
+            _tsr_kernel_fused<4, 2, 6, 3, 3><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, partial_results, ready_flags);
+            break;
+        case 5:
+            block.x = WARPSIZE * (2 + 9 + 2);
+            _tsr_kernel_fused<5, 2, 9, 2, 2><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, partial_results, ready_flags);
+            break;
+        default:
+            break;
+    }
+
+    // Poll for ready flags and perform NCCL all-reduce
+    for (int i = 0; i < 2; i++) {
+        int flag = 0;
+        while (flag == 0) {
+            hipMemcpy(&flag, &ready_flags[i], sizeof(int), hipMemcpyDeviceToHost);
+        }
+
+        // Perform NCCL all-reduce for this partial result
+        ncclAllReduce((const void*)(partial_results + i * 3 * 8 * OP_N * b_lanes),
+                      (void*)(partial_results + i * 3 * 8 * OP_N * b_lanes),
+                      3 * 8 * OP_N * b_lanes,
+                      ncclHalf, ncclSum, comm, stream);
+    }
+
+    // Store final results back to D
+    cudaMemcpyAsync(D.data_ptr(), partial_results, CONSUMERS_ * B_LANES_ * WARPTILE_M * OP_N * b_lanes * sizeof(half), cudaMemcpyDeviceToDevice, stream);
+
+    // Synchronize the stream to ensure all operations are complete
+    cudaStreamSynchronize(stream);
+
+    // Free memory and destroy events
+    cudaFree(partial_results);
+    delete[] ready_flags;
+    cudaStreamDestroy(stream);
+}
+
+
+// Initialize NCCL and return the communicator
+ncclComm_t initialize_nccl(int8_t world_size, int8_t rank) {
+    ncclUniqueId unique_id;
+    ncclComm_t comm;
+
+    // Generate unique ID on rank 0 and broadcast it to all ranks
+    if (rank == 0) {
+        ncclGetUniqueId(&unique_id);
+    }
+
+    // Broadcast unique ID to all ranks (assuming MPI or similar)
+    // For simplicity, this example assumes rank 0 initializes and broadcasts the ID
+    // In a real distributed setup, you would use MPI or another method to broadcast the ID
+
+    // Initialize NCCL communicator
+    ncclCommInitRank(&comm, world_size, unique_id, rank);
+
+    return comm;
+}
+
+class FusedGEMMAR : public torch::CustomClassHolder {
+public:
+    FusedGEMMAR(int8_t world_size, int8_t rank);
+    ~FusedGEMMAR();
+
+    void gemm_ar(
+        torch::Tensor& A,
+        torch::Tensor& B,
+        torch::Tensor& D,
+        torch::Tensor& scale_tensor,
+        int64_t b_lanes,
+        int64_t split_k);
+
+private:
+    ncclComm_t comm;
+};
+
+
+void FusedGEMMAR::gemm_ar(
+        torch::Tensor& A,
+        torch::Tensor& B,
+        torch::Tensor& D,
+        torch::Tensor& scale_tensor,
+        int64_t b_lanes,
+        int64_t split_k) {
+        fused_gemm_ar(A, B, D, scale_tensor, b_lanes, split_k, this->comm);
+}
+
+FusedGEMMAR::FusedGEMMAR(int8_t world_size, int8_t rank) {
+    ncclUniqueId unique_id;
+    if (rank == 0) {
+        ncclGetUniqueId(&unique_id);
+    }
+    ncclCommInitRank(&comm, world_size, unique_id, rank);
+}
+
+FusedGEMMAR::~FusedGEMMAR() {
+    ncclCommDestroy(comm);
+}
+
+
+#define PYBIND11_MODULE_EXPAND(NAME, MODULE) PYBIND11_MODULE(NAME, MODULE)
+
+PYBIND11_MODULE_EXPAND(TORCH_EXTENSION_NAME, m) {
+    py::class_<FusedGEMMAR>(m, "FusedGEMMAR")
+        .def(py::init<int, int>())
+        .def("fused_gemm_ar", &FusedGEMMAR::gemm_ar);
+}
