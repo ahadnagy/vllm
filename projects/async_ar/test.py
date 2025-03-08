@@ -4,6 +4,8 @@ from torch import Tensor
 
 from hip_fused_gemm_nccl import FusedGEMMAR
 import pytest
+import torch.multiprocessing as mp
+import torch.distributed as dist
 
 
 
@@ -80,7 +82,7 @@ def test_process(
     Each spawned process runs this function independently.
     """
 
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, init_method="tcp://127.0.0.1:22500")
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size, init_method="tcp://127.0.0.1:22500")
     
     comm = None
 
@@ -89,9 +91,16 @@ def test_process(
 
     #process_group = dist.distributed_c10d._get_default_group()
     
-    gemmar = FusedGEMMAR(world_size, rank)
+    gemmar = FusedGEMMAR(world_size, rank, torch.distributed.group.WORLD)
+    
+    skinny_a, b, scale_tensor, out = generate_skinny_gemm_data(m, n, k, seed=0)
 
-    result =  FusedGEMMAR.gemm_ar(m, n, k, split_k, b_lanes)
+    result = out.clone()
+    
+    skinny_a = skinny_a.to(dtype=torch.float16)
+    b = b.to(dtype=torch.float16)
+
+    gemmar.gemm_ar(skinny_a, b, result, scale_tensor, split_k, b_lanes)
     print(f"result: {result}")
     print(f"Test passed for Split-K = {split_k} on rank {rank}!")
 
@@ -108,10 +117,10 @@ def test_fused_gemm_ar(m, n, k, split_k, b_lanes):
     """
     Multi-GPU test for Split-K GEMM using multiprocessing.
     """
-    world_size = torch.cuda.device_count()  # Use all available GPUs
-
+    #world_size = torch.cuda.device_count()  # Use all available GPUs
+    world_size = 2
     if world_size < 2:
         pytest.skip("Test requires at least 2 GPUs.")
 
     # ✅ Spawn processes, each running `setup_process()`
-    spawn(test_process, args=(world_size, m, n, k, split_k, b_lanes), nprocs=world_size, join=True)
+    mp.spawn(test_process, args=(world_size, m, n, k, split_k, b_lanes), nprocs=world_size, join=True)
