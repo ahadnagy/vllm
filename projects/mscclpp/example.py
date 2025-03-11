@@ -24,8 +24,8 @@ def init_process(rank, world_size, master_addr):
     """Initialize process group and set environment variables"""
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = '29500'
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['RANK'] = str(rank)
+    os.environ['OMPI_COMM_WORLD_SIZE'] = str(world_size)
+    os.environ['OMPI_COMM_WORLD_RANK'] = str(rank)
     
     # Set device
     torch.cuda.set_device(rank)
@@ -105,7 +105,12 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
         allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size)
         
         # Perform reduction
-        allreduce.reduce(skinny_a, b, out.clone(), scale_tensor, split_k, b_lanes)
+        allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
+        #allreduce.comm_test()
+        
+        torch.cuda.synchronize()
+        
+        print(out)
         
     except Exception as e:
         print(f"Error on rank {rank}: {str(e)}")
@@ -113,10 +118,11 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
 
 def test_process():
     M = 8
-    N = 13312
+    #N = 13312
+    N=256
     K = 16384
     B_LANES = 5
-    SPLIT_K = 6
+    SPLIT_K = 3
     
     # Use all available GPUs
     world_size = torch.cuda.device_count()

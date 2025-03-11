@@ -8,10 +8,15 @@
 #include <mscclpp/memory_channel.hpp>
 #include <c10/hip/HIPStream.h>
 
+
 // Forward declaration of CUDA functions
 // void launch_allreduce(float* data, size_t count, 
 //                      mscclpp::DeviceHandle<mscclpp::PortChannel>* channels,
 //                      int numChannels, hipStream_t stream);
+
+void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Tensor& scale_tensor, int64_t b_lanes,
+    int64_t split_k);
+
 
 #define CUDATHROW(cmd)                                                                                                \
   do {                                                                                                                \
@@ -22,10 +27,6 @@
       throw std::runtime_error(msg);                                                                                  \
     }                                                                                                                 \
   } while (0)
-
-template <class T>
-using DeviceHandle = mscclpp::DeviceHandle<T>;
-__device__ __constant__ DeviceHandle<mscclpp::PortChannel> constRingChannels[4];
 
 
 class AllReduceEngine {

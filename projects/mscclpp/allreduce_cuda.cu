@@ -7,25 +7,13 @@
 #include <mscclpp/memory_channel.hpp>
 #include <c10/hip/HIPStream.h>
 
+#include "skinny_gemm/skinny_gemm.cu"
+
+
 // Forward declaration of CUDA functions
 // void launch_allreduce(float* data, size_t count, 
 //                      mscclpp::DeviceHandle<mscclpp::PortChannel>* channels,
 //                      int numChannels, hipStream_t stream);
-
-#define CUDATHROW(cmd)                                                                                                \
-  do {                                                                                                                \
-    cudaError_t err = cmd;                                                                                            \
-    if (err != cudaSuccess) {                                                                                         \
-      std::string msg = std::string("Test CUDA failure: ") + std::string(__FILE__) + ":" + std::to_string(__LINE__) + \
-                        " '" + cudaGetErrorString(err) + "'";                                                         \
-      throw std::runtime_error(msg);                                                                                  \
-    }                                                                                                                 \
-  } while (0)
-
-template <class T>
-using DeviceHandle = mscclpp::DeviceHandle<T>;
-__device__ __constant__ DeviceHandle<mscclpp::PortChannel> constRingChannels[16];
-
 
 class AllReduceEngine {
 public:
@@ -40,7 +28,7 @@ public:
         //}
     }
 
-    void reduce(
+    torch::Tensor reduce(
         torch::Tensor& A,
         torch::Tensor& B,
         torch::Tensor& D,
@@ -50,35 +38,47 @@ public:
         TORCH_CHECK(A.is_cuda(), "Input tensor must be a CUDA tensor");
         TORCH_CHECK(A.is_contiguous(), "Input tensor must be contiguous");
 
-
+ 
         // Setup mesh connections
-        allocateInputBuffers(10);
+        allocateInputBuffers(D.numel() * D.element_size());
+        printf("Allocated input buffers\n");
         setupMeshConnections();
+        printf("Setup mesh connections\n");
+
+        CUDATHROW(cudaDeviceSynchronize());
+        skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, input_buff_.get());
+        CUDATHROW(cudaDeviceSynchronize());
 
         // Launch allreduce
         
         //hipStream_t stream = at::hip::getCurrentHIPStream(tensor.device().index());
         //launch_allreduce(data_ptr, count, deviceChannels_, 
         //                worldSize_ - 1, stream);
+        return D;
     }
-
+    
 private:
     void bootstrap() {
         // Use longer timeout for initialization
 
-        MPI_Init(NULL, NULL);
-        MPI_Comm_size(MPI_COMM_WORLD, &worldSize_);
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
+        //MPI_Init(NULL, NULL);
+        //MPI_Comm_size(MPI_COMM_WORLD, &worldSize_);
+        //MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
+
+        printf("Rank %d: World size %d\n", rank_, worldSize_);
 
         std::string ip_port = "localhost:12000";
         auto bootstrap = std::make_shared<mscclpp::TcpBootstrap>(rank_, worldSize_);
         
         // Initialize with options
         //bootstrap->initialize(ip_port, options);
-        mscclpp::UniqueId id;
-        if (bootstrap->getRank() == 0) id = bootstrap->createUniqueId();
-        MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
-        bootstrap->initialize(id);
+        //mscclpp::UniqueId id;
+        //if (bootstrap->getRank() == 0) id = bootstrap->createUniqueId();
+        //MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+        //bootstrap->initialize(id);
+        bootstrap->initialize("127.0.0.1:50000");
+        bootstrap->barrier();
+        printf("Initialized comms\n");
         
         // Create communicator and wait for all processes
         communicator_ = std::make_shared<mscclpp::Communicator>(bootstrap);
@@ -86,7 +86,7 @@ private:
     }
 
     void allocateInputBuffers(size_t bytes) {
-        input_buff_ = mscclpp::GpuBuffer<int>(bytes / sizeof(int)).memory();
+        input_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
         input_buff_bytes_ = bytes;
     }
 
@@ -95,9 +95,9 @@ private:
         std::vector<mscclpp::NonblockingFuture<mscclpp::RegisteredMemory>> remoteRegMemories;
         std::vector<mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>> connectionFutures;
 
-        
+        printf("Rank %d: Setting up mesh connections\n", rank_);
         mscclpp::RegisteredMemory inputBufRegMem = communicator_->registerMemory(input_buff_.get(), input_buff_bytes_, transport);
-
+        printf("Registered memory\n");
 
         // Connect with all other ranks
         for (int r = 0; r < worldSize_; ++r) {
@@ -106,13 +106,16 @@ private:
             communicator_->sendMemoryOnSetup(inputBufRegMem, r, 0);
             remoteRegMemories.push_back(communicator_->recvMemoryOnSetup(r, 0));
         }
+        printf("Connected with all other ranks\n");
 
         communicator_->setup();
 
-        for (int r = 0; r < worldSize_; ++r) {
-            if (r == rank_) continue;
-            connections_[r] = connectionFutures[r].get();
-        }
+        printf("Setup communicator\n");
+
+        std::transform(
+            connectionFutures.begin(), connectionFutures.end(), std::back_inserter(connections_),
+            [](const mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>& future) { return future.get(); });
+        printf("Got connections\n");
 
 
         auto service = std::dynamic_pointer_cast<mscclpp::ProxyService>(chanService_);
@@ -122,52 +125,19 @@ private:
                                      service->addMemory(remoteRegMemories[i].get()), service->addMemory(inputBufRegMem))));
         }
 
+        printf("Created channels: %d\n", channels_.size());
+
         communicator_->setup();
 
         CUDATHROW(cudaMemcpyToSymbol(constRingChannels, channels_.data(),
                                  sizeof(DeviceHandle<mscclpp::PortChannel>) * channels_.size()));
+
+        printf("Copied channels to device\n");
+
+        this->chanService_->startProxy();
+        communicator_->bootstrap()->barrier();
+        printf("Started proxy\n");
     }
-
-
-    // void setupChannels() {
-    //     std::string ip_port = "127.0.0.1:50000";
-    //     auto bootstrap = std::make_shared<mscclpp::TcpBootstrap>(rank_, worldsize_);
-    //     bootstrap->initialize(ip_port);
-    //     communicator_ = std::make_shared<mscclpp::Communicator>(bootstrap);
-    //     mscclpp::ProxyService proxyService;
-
-    //     communicator_->registerMemory
-        
-    //     // Create channels for ring communication
-    //     for (int i = 0; i < worldSize_; i++) {
-    //         if (i == rank_) continue;
-            
-    //         // Create port channel
-    //         auto channel = std::make_unique<mscclpp::MemoryChannel>();
-            
-    //         // Configure channel
-    //         mscclpp::PortConfig config;
-    //         config.setRemoteRank(i);
-    //         channel->configure(config);
-            
-    //         // Register memory
-    //         channel->registerMemory(*communicator_);
-            
-    //         channels_.push_back(std::move(channel));
-    //     }
-
-    //     // Allocate and copy device handles
-    //     hipMalloc(&deviceChannels_, 
-    //               channels_.size() * sizeof(mscclpp::DeviceHandle<mscclpp::PortChannel>));
-        
-    //     // Copy channel handles to device
-    //     for (size_t i = 0; i < channels_.size(); i++) {
-    //         auto handle = channels_[i]->deviceHandle();
-    //         hipMemcpy(&deviceChannels_[i], &handle, 
-    //                  sizeof(mscclpp::DeviceHandle<mscclpp::PortChannel>),
-    //                  hipMemcpyHostToDevice);
-    //     }
-    // }
 
 
     int rank_;
@@ -178,16 +148,8 @@ private:
     std::shared_ptr<mscclpp::BaseProxyService> chanService_;
     cudaStream_t stream_;
 
-    std::shared_ptr<int> input_buff_;
+    std::shared_ptr<uint8_t> input_buff_;
     size_t input_buff_bytes_;
-    //mscclpp::DeviceHandle<mscclpp::PortChannel>* deviceChannels_;
-
-
-    //std::vector<mscclpp::SemaphoreId> semaphoreIds;
-    //std::vector<mscclpp::RegisteredMemory> localMemories;
-    //std::vector<mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>> connections;
-    //std::vector<mscclpp::NonblockingFuture<mscclpp::RegisteredMemory>> remoteMemories;
-
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
