@@ -9,12 +9,6 @@
 
 #include "skinny_gemm/skinny_gemm.cu"
 
-
-// Forward declaration of CUDA functions
-// void launch_allreduce(float* data, size_t count, 
-//                      mscclpp::DeviceHandle<mscclpp::PortChannel>* channels,
-//                      int numChannels, hipStream_t stream);
-
 class AllReduceEngine {
 public:
     AllReduceEngine(int rank, int worldSize) 
@@ -37,23 +31,16 @@ public:
         int64_t split_k) {
         TORCH_CHECK(A.is_cuda(), "Input tensor must be a CUDA tensor");
         TORCH_CHECK(A.is_contiguous(), "Input tensor must be contiguous");
-
  
         // Setup mesh connections
-        allocateInputBuffers(D.numel() * D.element_size());
+        allocateCommsBuffers(D.numel() * D.element_size());
         printf("Allocated input buffers\n");
         setupMeshConnections();
         printf("Setup mesh connections\n");
 
         CUDATHROW(cudaDeviceSynchronize());
-        skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, input_buff_.get());
+        skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, comms_buff_.get());
         CUDATHROW(cudaDeviceSynchronize());
-
-        // Launch allreduce
-        
-        //hipStream_t stream = at::hip::getCurrentHIPStream(tensor.device().index());
-        //launch_allreduce(data_ptr, count, deviceChannels_, 
-        //                worldSize_ - 1, stream);
         return D;
     }
 
@@ -85,9 +72,9 @@ private:
         chanService_ = std::make_shared<mscclpp::ProxyService>();
     }
 
-    void allocateInputBuffers(size_t bytes) {
-        input_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
-        input_buff_bytes_ = bytes;
+    void allocateCommsBuffers(size_t bytes) {
+        comms_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
+        comms_buff_bytes_ = bytes;
     }
 
     void setupMeshConnections() {
@@ -96,7 +83,7 @@ private:
         std::vector<mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>> connectionFutures;
 
         printf("Rank %d: Setting up mesh connections\n", rank_);
-        mscclpp::RegisteredMemory inputBufRegMem = communicator_->registerMemory(input_buff_.get(), input_buff_bytes_, transport);
+        mscclpp::RegisteredMemory inputBufRegMem = communicator_->registerMemory(comms_buff_.get(), comms_buff_bytes_, transport);
         printf("Registered memory\n");
 
         // Connect with all other ranks
@@ -148,8 +135,8 @@ private:
     std::shared_ptr<mscclpp::BaseProxyService> chanService_;
     cudaStream_t stream_;
 
-    std::shared_ptr<uint8_t> input_buff_;
-    size_t input_buff_bytes_;
+    std::shared_ptr<uint8_t> comms_buff_;
+    size_t comms_buff_bytes_;
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
