@@ -20,12 +20,28 @@ from torch import Tensor
 import mscclpp_allreduce
 import os
 
+import torch.distributed as dist
+from hf_rocm_kernels import skinny_gemm
+
+import timeit
+
+def skinny_gemm_and_ar_pytorch(a, b, d, scale):
+    # Perform GEMM
+    skinny_gemm(
+                skinny_a=a,
+                b=b,
+                scale_tensor=scale,
+                output=d,
+                split_k=9,
+                b_lanes=5,
+            )
+    dist.all_reduce(d, op=dist.ReduceOp.SUM)
+
 def init_process(rank, world_size, master_addr):
     """Initialize process group and set environment variables"""
-    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
-    os.environ['OMPI_COMM_WORLD_SIZE'] = str(world_size)
-    os.environ['OMPI_COMM_WORLD_RANK'] = str(rank)
+    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
     
     # Set device
     torch.cuda.set_device(rank)
@@ -79,13 +95,13 @@ def generate_skinny_gemm_data(
     (k), and one can pass a (seed) to ensure repeatability."""
     if seed is not None:
         torch.manual_seed(seed)
-    scale_tensor = torch.rand(size=(1,), device="cuda", dtype=torch.float32).mul(2).add(1)
+    scale_tensor = torch.ones(size=(1,), device="cuda", dtype=torch.float32).mul(2).add(1)
     skinny_a = fp8_quantize(
-        torch.normal(0, 1, size=(m, k), device="cuda", dtype=torch.float32),
+        torch.ones(size=(m, k), device="cuda", dtype=torch.float32),
         scale_tensor,
     )[0]
     b = fp8_quantize(
-        torch.normal(0, 1, size=(n, k), device="cuda", dtype=torch.float32),
+        torch.ones(size=(n, k), device="cuda", dtype=torch.float32),
         scale_tensor,
     )[0].t()
     output = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
@@ -101,15 +117,22 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
         # Generate data
         skinny_a, b, scale_tensor, out = generate_skinny_gemm_data(m, n, k, seed=0)
         
+        print("out_size: ", out.shape)
+        
         # Create AllReduce instance
         allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size)
         
         # Perform reduction
         allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
-        #allreduce.comm_test()
+        #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
         
-        torch.cuda.synchronize()
+        #fused = timeit.timeit(lambda: allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes), number=1)
+        #torch = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=1)
         
+        #print(f"Fused: {fused} \n")
+        #print(f"Pytorch: {torch} \n")
+                
+        #print("skinny_a: ", skinny_a)        
         print(out)
         
     except Exception as e:
@@ -119,7 +142,7 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
 def test_process():
     M = 8
     #N = 13312
-    N=256
+    N=2048
     K = 16384
     B_LANES = 5
     SPLIT_K = 3

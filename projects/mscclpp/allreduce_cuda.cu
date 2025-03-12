@@ -56,7 +56,7 @@ public:
         //                worldSize_ - 1, stream);
         return D;
     }
-    
+
 private:
     void bootstrap() {
         // Use longer timeout for initialization

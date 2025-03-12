@@ -16,15 +16,21 @@ __global__ void vectorized_half_sum_inplace(__half* __restrict__ D, const __half
 
     // Ring all-reduce
     for (int step = 0; step < world_size - 1; ++step) {
-        for (int i = idx; i < size / 2; i += stride) {
-            half2_t a = reinterpret_cast<half2_t*>(D)[i];
-            half2_t b = reinterpret_cast<const half2_t*>(input_buff)[i];
-            reinterpret_cast<half2_t*>(D)[i] = __hadd2(a, b);  // In-place addition
+        // for (int i = idx; i < size / 2; i += stride) {
+        //     half2_t a = reinterpret_cast<half2_t*>(D)[i];
+        //     half2_t b = reinterpret_cast<const half2_t*>(input_buff)[i];
+        //     reinterpret_cast<half2_t*>(D)[i] = __hadd2(a, 2);  // In-place addition
+        // }
+
+        for (int i = idx * 2; i < size; i += stride * 2) {
+            half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
+            half2_t b = reinterpret_cast<const half2_t*>(input_buff)[i / 2];
+            reinterpret_cast<half2_t*>(D)[i / 2] = __hadd2(a, b);  // In-place addition
         }
     
         // Handle odd-length case (if n is odd)
         if (idx == 0 && (size % 2) != 0) {
-            D[size - 1] = __hadd(D[size - 1], input_buff[size - 1]);
+            //D[size - 1] = __hadd(D[size - 1], input_buff[size - 1]);
         }
 
         // kick data around the ring
@@ -36,9 +42,9 @@ __global__ void vectorized_half_sum_inplace(__half* __restrict__ D, const __half
             DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
             DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
             printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
-            right.putWithSignal(0, size);
-            right.flush();
-            left.wait();
+            //right.putWithSignal(0, size);
+            //right.flush();
+            //left.wait();
             printf("Allreduce Rank %d: Received data from %d\n", rank, peerRecvRank);
             __syncthreads();
         }
@@ -123,7 +129,7 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
             //printf("Consumer starting\n");
             _tsr_consumer<CONSUMERS, B_LANES, QSIZE>(&A_buffer[0], &B_buffer[0], D + curr_n, scale_tensor[0], &queue[0],
                                                      index, p_state, role_id, n, dropped_rows, dropped_cols, k,
-                                                     k_blocks, scratch);
+                                                     k_blocks, scratch + curr_n);
 
             if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE) {
                 // Send th result around the ring, only one threads needs to do this
@@ -135,8 +141,9 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
                 DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
                 printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
                 right.putWithSignal(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
+                //right.putWithSignal(0, m*n*2);
                 right.flush();
-                left.wait();
+                //left.wait();
                 printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
                 deviceSyncer.sync(gridDim.x);
                 __syncthreads();
@@ -190,6 +197,7 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
 
     //Reduction
     int threads = 256;
+    //int blocks = ((D.numel() / 2) + (threads / 2) - 1) / (threads / 2);
     int blocks = (D.numel() / 2 + threads - 1) / threads;
     vectorized_half_sum_inplace<<<blocks, threads, 0, stream>>>(D_, scratch_, D.numel(), rank, world_size);
 
