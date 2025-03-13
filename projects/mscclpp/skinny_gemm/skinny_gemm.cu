@@ -16,7 +16,7 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
 
     // Ring all-reduce
     for (int step = 0; step < world_size - 1; ++step) {
-        // The first comms iteration in the rings is performed during
+        // The first comms iteration in the ring is performed during
         // the GEMM operation, so we can start with a reduce here
         for (int i = idx * 2; i < size; i += stride * 2) {
             half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
@@ -178,24 +178,22 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
             if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE) {
                 // Send the result around the ring, only one thread needs to do this
                 printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
-                //right.put(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
-                right.put(0, m * n * 2);
-                //right.flush();
-                //left.wait();
+                right.put(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
                 printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
             }
         }
     }
     deviceSyncer.sync(gridDim.x, -1);
     if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE && blockIdx.x == 0) {
-        // Send the result around the ring, only one thread needs to do this
-        //printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
-        //right.putWithSignal(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
+        // Send the result around the ring, only one thread needs to do this.
+        // We must sync here to make sure no other thread submits
+        // after the signal&flush.
+        // Ideally, most of the transfers are alredy popped off the FIFO
+        // and processed by the time we get here.
         __syncthreads();
         right.signal();
         right.flush();
         left.wait();
-        __syncthreads();
         printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
     }
 }

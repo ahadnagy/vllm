@@ -1,17 +1,3 @@
-# import torch
-# import mscclpp_allreduce
-
-# # Initialize with rank and world size
-# rank = 0  # This should come from your distributed setup
-# world_size = 4
-# allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size)
-
-# # Create some data
-# data = torch.randn(1024, device='cuda')
-
-# # Perform all-reduce
-# allreduce.reduce(data) 
-
 from typing import Tuple, Optional
 import pytest
 import torch
@@ -108,7 +94,7 @@ def generate_skinny_gemm_data(
     return skinny_a, b, scale_tensor, output
 
 
-def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_lanes: int):
+def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_lanes: int):
     """Test for the skinny_gemm operation."""
     try:
         # Initialize process
@@ -131,9 +117,6 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
         
         print(f"Fused: {fused} \n")
         print(f"Pytorch: {torch} \n")
-                
-        #print("skinny_a: ", skinny_a)        
-        print(out)
         
     except Exception as e:
         print(f"Error on rank {rank}: {str(e)}")
@@ -154,7 +137,7 @@ def test_process():
     
     # Start multiple processes
     mp.spawn(
-        _test_skinny_gemm,
+        _benchmark_skinny_gemm,
         args=(world_size, M, N, K, SPLIT_K, B_LANES),
         nprocs=world_size,
         join=True,
