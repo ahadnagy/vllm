@@ -9,7 +9,7 @@ __constant__ DeviceHandle<mscclpp::PortChannel> constRingChannels[7];
 
 __device__ mscclpp::DeviceSyncer deviceSyncer;
 
-__global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* __restrict__ comms_buff, int size, int rank, int world_size) {
+__global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* __restrict__ recv_buff, __half* __restrict__ send_buff, int size, int rank, int world_size) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = gridDim.x * blockDim.x;
     using half2_t = __half2;
@@ -20,18 +20,20 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
         // the GEMM operation, so we can start with a reduce here
         for (int i = idx * 2; i < size; i += stride * 2) {
             half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
-            half2_t b = reinterpret_cast<const half2_t*>(comms_buff)[i / 2];
+            half2_t b = reinterpret_cast<const half2_t*>(recv_buff)[i / 2];
             reinterpret_cast<half2_t*>(D)[i / 2] = __hadd2(a, b);  // In-place addition
+            send_buff[i] = recv_buff[i];
+            send_buff[i + 1] = recv_buff[i + 1];
         }
     
         // Handle odd-length case (if n is odd)
         if (idx == 0 && (size % 2) != 0) {
-            D[size - 1] = __hadd(D[size - 1], comms_buff[size - 1]);
+            D[size - 1] = __hadd(D[size - 1], recv_buff[size - 1]);
+            send_buff[size - 1] = recv_buff[size - 1];
         }
 
         // Kick data around the ring
         // TODO: implement double buffering (double comm channels)
-        // deviceSyncer.sync(gridDim.x, -1);
         // if (idx == 0) {
         //     int peerSendRank = (rank + 1) % world_size;
         //     int peerRecvRank = (rank - 1 + world_size) % world_size;
@@ -49,7 +51,6 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
         //     left.wait();
         //     printf("Allreduce Rank %d: Received data from %d\n", rank, peerRecvRank);
         // }
-        // deviceSyncer.sync(gridDim.x, -1);
 
         int peerSendRank = (rank + 1) % world_size;
         int peerRecvRank = (rank - 1 + world_size) % world_size;
@@ -90,7 +91,7 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
 
 #define launch_tsr(BL, AP, BP, C, QS)                                                                        \
     block.x = WARPSIZE * (AP + BP + C); \
-    _tsr_kernel<BL, AP, BP, C, QS><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, rank, world_size, scratch_); \
+    _tsr_kernel<BL, AP, BP, C, QS><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, rank, world_size, send_buff_); \
     break;
 
 template <int B_LANES, int A_PRODUCERS, int B_PRODUCERS, int CONSUMERS, int QSIZE>
@@ -176,14 +177,16 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
             if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE) {
                 // Send the result around the ring, only one thread needs to do this
                 printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
-                right.put(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
+                //right.put(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
+                right.put(0, m * n * 2);
                 //right.flush();
                 //left.wait();
                 printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
             }
         }
     }
-    if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE) {
+    deviceSyncer.sync(gridDim.x, -1);
+    if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE && blockIdx.x == 0) {
         // Send the result around the ring, only one thread needs to do this
         //printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
         //right.putWithSignal(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
@@ -197,7 +200,7 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
 }
 
 void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Tensor& scale_tensor, int64_t b_lanes,
-                 int64_t split_k, const int rank, const int world_size, uint8_t* scratch) {
+                 int64_t split_k, const int rank, const int world_size, uint8_t* recv_buff, uint8_t* send_buff) {
     const int m = A.size(0);
     const int n = B.size(1);
     const int k = A.size(1);
@@ -207,7 +210,8 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     half* __restrict__ D_ = (half* __restrict__)D.data_ptr();
     float* __restrict__ scale_tensor_ = (float* __restrict__)scale_tensor.data_ptr();
 
-    half* __restrict__ scratch_ = (half* __restrict__)scratch;
+    half* __restrict__ recv_buff_ = (half* __restrict__)recv_buff;
+    half* __restrict__ send_buff_ = (half* __restrict__)send_buff;
 
     // Check shape
     if (m > WARPTILE_M) {
@@ -242,6 +246,6 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     //Reduction
     int threads = 256;
     int blocks = (D.numel() / 2 + threads - 1) / threads;
-    vectorized_reduce_inplace<<<blocks, threads, 0, stream>>>(D_, scratch_, D.numel(), rank, world_size);
+    vectorized_reduce_inplace<<<blocks, threads, 0, stream>>>(D_, recv_buff_, send_buff_, D.numel(), rank, world_size);
     cudaStreamSynchronize(stream);
 }

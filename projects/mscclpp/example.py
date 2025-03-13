@@ -142,7 +142,7 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
 def test_process():
     M = 8
     #N = 13312
-    N=13312
+    N=2048
     K = 16384
     B_LANES = 5
     SPLIT_K = 3

@@ -39,7 +39,7 @@ public:
         printf("Setup mesh connections\n");
 
         CUDATHROW(cudaDeviceSynchronize());
-        skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, comms_buff_.get());
+        skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, recv_buff_.get(), send_buff_.get());
         CUDATHROW(cudaDeviceSynchronize());
         return D;
     }
@@ -73,7 +73,8 @@ private:
     }
 
     void allocateCommsBuffers(size_t bytes) {
-        comms_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
+        recv_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
+        send_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
         comms_buff_bytes_ = bytes;
     }
 
@@ -83,14 +84,15 @@ private:
         std::vector<mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>> connectionFutures;
 
         printf("Rank %d: Setting up mesh connections\n", rank_);
-        mscclpp::RegisteredMemory inputBufRegMem = communicator_->registerMemory(comms_buff_.get(), comms_buff_bytes_, transport);
+        mscclpp::RegisteredMemory recvBufRegMem = communicator_->registerMemory(recv_buff_.get(), comms_buff_bytes_, transport);
+        mscclpp::RegisteredMemory sendBufRegMem = communicator_->registerMemory(send_buff_.get(), comms_buff_bytes_, transport);
         printf("Registered memory\n");
 
         // Connect with all other ranks
         for (int r = 0; r < worldSize_; ++r) {
             if (r == rank_) continue;
             connectionFutures.push_back(communicator_->connectOnSetup(r, 0, transport));
-            communicator_->sendMemoryOnSetup(inputBufRegMem, r, 0);
+            communicator_->sendMemoryOnSetup(recvBufRegMem, r, 0);
             remoteRegMemories.push_back(communicator_->recvMemoryOnSetup(r, 0));
         }
         printf("Connected with all other ranks\n");
@@ -109,7 +111,7 @@ private:
         for (size_t i = 0; i < connections_.size(); ++i) {
             channels_.push_back(mscclpp::deviceHandle(
                 service->portChannel(service->buildAndAddSemaphore(*communicator_, connections_[i]),
-                                     service->addMemory(remoteRegMemories[i].get()), service->addMemory(inputBufRegMem))));
+                                     service->addMemory(remoteRegMemories[i].get()), service->addMemory(sendBufRegMem))));
         }
 
         printf("Created channels: %d\n", channels_.size());
@@ -135,7 +137,8 @@ private:
     std::shared_ptr<mscclpp::BaseProxyService> chanService_;
     cudaStream_t stream_;
 
-    std::shared_ptr<uint8_t> comms_buff_;
+    std::shared_ptr<uint8_t> recv_buff_;
+    std::shared_ptr<uint8_t> send_buff_;
     size_t comms_buff_bytes_;
 };
 
