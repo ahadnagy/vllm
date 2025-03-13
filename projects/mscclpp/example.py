@@ -123,14 +123,14 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
         allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size)
         
         # Perform reduction
-        allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
+        #allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
         #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
         
-        #fused = timeit.timeit(lambda: allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes), number=1)
-        #torch = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=1)
+        fused = timeit.timeit(lambda: allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes), number=1)
+        torch = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=1)
         
-        #print(f"Fused: {fused} \n")
-        #print(f"Pytorch: {torch} \n")
+        print(f"Fused: {fused} \n")
+        print(f"Pytorch: {torch} \n")
                 
         #print("skinny_a: ", skinny_a)        
         print(out)
@@ -142,7 +142,7 @@ def _test_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_
 def test_process():
     M = 8
     #N = 13312
-    N=2048
+    N=13312
     K = 16384
     B_LANES = 5
     SPLIT_K = 3

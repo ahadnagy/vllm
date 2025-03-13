@@ -34,59 +34,60 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
 
         // Kick data around the ring
         // TODO: implement double buffering (double comm channels)
-        // if (idx == 0) {
-        //     int peerSendRank = (rank + 1) % world_size;
-        //     int peerRecvRank = (rank - 1 + world_size) % world_size;
-        //     int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
-        //     int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
-        //     DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
-        //     DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
-        //     printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
-        //     right.put(0, size);
-        //     printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
-        //     right.signal();
-        //     printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
-        //     right.flush();
-        //     printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
-        //     left.wait();
-        //     printf("Allreduce Rank %d: Received data from %d\n", rank, peerRecvRank);
-        // }
-
-        int peerSendRank = (rank + 1) % world_size;
-        int peerRecvRank = (rank - 1 + world_size) % world_size;
-        int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
-        int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
-        DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
-        DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
+        deviceSyncer.sync(gridDim.x, -1);
         if (idx == 0) {
-            if (rank == 0) {
-                // Rank 0 starts the communication by sending data
-                printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
-                right.put(0, size);
-                printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
-                right.signal();
-                printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
-                right.flush();
-                printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
-            }
-        
-            // All ranks (including rank 0) wait to receive data
-            printf("Allreduce Rank %d: Waiting to receive data from %d\n", rank, peerRecvRank);
+            int peerSendRank = (rank + 1) % world_size;
+            int peerRecvRank = (rank - 1 + world_size) % world_size;
+            int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
+            int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
+            DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
+            DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
+            printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
+            right.put(0, size);
+            printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
+            right.signal();
+            printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
+            right.flush();
+            printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
             left.wait();
             printf("Allreduce Rank %d: Received data from %d\n", rank, peerRecvRank);
-        
-            // After receiving, ranks other than 0 send data to the next rank
-            if (rank != 0) {
-                printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
-                right.put(0, size);
-                printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
-                right.signal();
-                printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
-                right.flush();
-                printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
-            }
         }
-    }
+        deviceSyncer.sync(gridDim.x, -1);
+    //     int peerSendRank = (rank + 1) % world_size;
+    //     int peerRecvRank = (rank - 1 + world_size) % world_size;
+    //     int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
+    //     int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
+    //     DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
+    //     DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
+    //     if (idx == 0) {
+    //         if (rank == 0) {
+    //             // Rank 0 starts the communication by sending data
+    //             printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
+    //             right.put(0, size);
+    //             printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
+    //             right.signal();
+    //             printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
+    //             right.flush();
+    //             printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
+    //         }
+        
+    //         // All ranks (including rank 0) wait to receive data
+    //         printf("Allreduce Rank %d: Waiting to receive data from %d\n", rank, peerRecvRank);
+    //         left.wait();
+    //         printf("Allreduce Rank %d: Received data from %d\n", rank, peerRecvRank);
+        
+    //         // After receiving, ranks other than 0 send data to the next rank
+    //         if (rank != 0) {
+    //             printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
+    //             right.put(0, size);
+    //             printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
+    //             right.signal();
+    //             printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
+    //             right.flush();
+    //             printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
+    //         }
+    //     }
+     }
 }
 
 #define launch_tsr(BL, AP, BP, C, QS)                                                                        \
