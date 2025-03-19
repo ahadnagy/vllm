@@ -5,52 +5,78 @@
 
 template <class T>
 using DeviceHandle = mscclpp::DeviceHandle<T>;
-__constant__ DeviceHandle<mscclpp::PortChannel> constRingChannels[7];
+__constant__ DeviceHandle<mscclpp::PortChannel> constRingChannelsA[7];
+__constant__ DeviceHandle<mscclpp::PortChannel> constRingChannelsB[7];
 
 __device__ mscclpp::DeviceSyncer deviceSyncer;
 
-__global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* __restrict__ recv_buff, __half* __restrict__ send_buff, int size, int rank, int world_size) {
+__global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* __restrict__ buff_a, __half* __restrict__ buff_b, int size, int rank, int world_size) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = gridDim.x * blockDim.x;
     using half2_t = __half2;
 
+
+    // Figure out peer channels for comms
+    int peerSendRank = (rank + 1) % world_size;
+    int peerRecvRank = (rank - 1 + world_size) % world_size;
+    int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
+    int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
+
+    DeviceHandle<mscclpp::PortChannel>& left_a = constRingChannelsA[peerRecvId];
+    DeviceHandle<mscclpp::PortChannel>& right_a = constRingChannelsA[peerSendId];
+
+    DeviceHandle<mscclpp::PortChannel>& left_b = constRingChannelsB[peerRecvId];
+    DeviceHandle<mscclpp::PortChannel>& right_b = constRingChannelsB[peerSendId];
+
+    if(idx==0)
+        left_a.wait();
+    deviceSyncer.sync(gridDim.x, -1);
+
     // Ring all-reduce
     for (int step = 0; step < world_size - 1; ++step) {
+        if (idx == 0) {
+            if (step % 2 == 0) {
+                // Let's wait for the parallel transfer to complete (B->A)
+                printf("Allreduce Rank %d: Sending data B->A to %d\n", rank, peerSendRank);
+                right_b.put(0, size);
+                right_b.signal();
+            } else {
+                // Let's wait for the parallel transfer to complete (A->B)
+                printf("Allreduce Rank %d: Sending data A->B to %d\n", rank, peerSendRank);
+                right_a.put(0, size);
+                right_a.signal();
+            }
+        }
+
         // The first comms iteration in the ring is performed during
         // the GEMM operation, so we can start with a reduce here
         for (int i = idx * 2; i < size; i += stride * 2) {
             half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
-            half2_t b = reinterpret_cast<const half2_t*>(recv_buff)[i / 2];
+            //const __half2* buff = step % 2 == 0 ? buff_a : buff_b;
+            half2_t b = reinterpret_cast<const half2_t*>(step % 2 == 0 ? buff_b : buff_a)[i / 2];
+            //half2_t b = reinterpret_cast<const half2_t*>(buff_a)[i / 2];
             reinterpret_cast<half2_t*>(D)[i / 2] = __hadd2(a, b);  // In-place addition
-            send_buff[i] = recv_buff[i];
-            send_buff[i + 1] = recv_buff[i + 1];
         }
     
         // Handle odd-length case (if n is odd)
         if (idx == 0 && (size % 2) != 0) {
-            D[size - 1] = __hadd(D[size - 1], recv_buff[size - 1]);
-            send_buff[size - 1] = recv_buff[size - 1];
+            __half b = (step % 2 == 0 ? buff_b : buff_a)[size - 1];
+            D[size - 1] = __hadd(D[size - 1], b);
         }
 
         // Kick data around the ring
         // TODO: implement double buffering (double comm channels)
         deviceSyncer.sync(gridDim.x, -1);
         if (idx == 0) {
-            int peerSendRank = (rank + 1) % world_size;
-            int peerRecvRank = (rank - 1 + world_size) % world_size;
-            int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
-            int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
-            DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
-            DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
-            printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
-            right.put(0, size);
-            printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
-            right.signal();
-            printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
-            right.flush();
-            printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
-            left.wait();
-            printf("Allreduce Rank %d: Received data from %d\n", rank, peerRecvRank);
+            if (step % 2 == 0) {
+                // Let's wait for the parallel transfer to complete (B->A)
+                right_b.flush();
+                left_b.wait();
+            } else {
+                // Let's wait for the parallel transfer to complete (A->B)
+                right_a.flush();
+                left_a.wait();
+            }
         }
         deviceSyncer.sync(gridDim.x, -1);
     //     int peerSendRank = (rank + 1) % world_size;
@@ -92,7 +118,7 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
 
 #define launch_tsr(BL, AP, BP, C, QS)                                                                        \
     block.x = WARPSIZE * (AP + BP + C); \
-    _tsr_kernel<BL, AP, BP, C, QS><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, rank, world_size, send_buff_); \
+    _tsr_kernel<BL, AP, BP, C, QS><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, rank, world_size, buff_a_); \
     break;
 
 template <int B_LANES, int A_PRODUCERS, int B_PRODUCERS, int CONSUMERS, int QSIZE>
@@ -137,8 +163,8 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
     int peerRecvRank = (rank - 1 + world_size) % world_size;
     int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
     int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
-    DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
-    DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
+    DeviceHandle<mscclpp::PortChannel>& left = constRingChannelsA[peerRecvId];
+    DeviceHandle<mscclpp::PortChannel>& right = constRingChannelsA[peerSendId];
 
     // Tiles loop
     int curr_n, curr_k, k_blocks, dropped_rows, dropped_cols;
@@ -163,23 +189,27 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
         if (threadIdx.x < A_PRODUCERS * WARPSIZE) {
             _tsr_A_producer<A_PRODUCERS, B_LANES, QSIZE>(A + curr_k, &A_buffer[0], &queue[0], index, p_state, role_id,
                                                          dropped_rows, k, k_blocks);
+            __syncthreads();
         }
         // B producer warp
         else if (threadIdx.x < A_PRODUCERS * WARPSIZE + B_PRODUCERS * WARPSIZE) {
             _tsr_B_producer<B_PRODUCERS, B_LANES, QSIZE>(B + curr_n * k + curr_k, &B_buffer[0], &queue[1], index,
                                                          p_state, role_id, k, k_blocks);
+            __syncthreads();
         }
         // Consumers warp
         else if (threadIdx.x < (A_PRODUCERS + B_PRODUCERS + CONSUMERS) * WARPSIZE) {
             _tsr_consumer<CONSUMERS, B_LANES, QSIZE>(&A_buffer[0], &B_buffer[0], D + curr_n, scale_tensor[0], &queue[0],
                                                      index, p_state, role_id, n, dropped_rows, dropped_cols, k,
                                                      k_blocks, scratch + curr_n);
-
+            __syncthreads();
             if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE) {
                 // Send the result around the ring, only one thread needs to do this
-                printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
-                right.put(curr_n, WARPTILE_M * (OP_N * B_LANES) * 2);
-                printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
+                //printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
+                //for (int row = 0; row < 8 /* 8 rows tile */; row++) {
+                //    right.put(2*(curr_n + row * n), (16*B_LANES) * 2);
+                //}
+                //printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
             }
         }
     }
@@ -190,16 +220,17 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
         // after the signal&flush.
         // Ideally, most of the transfers are alredy popped off the FIFO
         // and processed by the time we get here.
-        __syncthreads();
+        right.put(0, m*n*2);
         right.signal();
         right.flush();
-        left.wait();
-        printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
+        //left.wait();
+        //printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
     }
+    deviceSyncer.sync(gridDim.x, -1);
 }
 
 void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Tensor& scale_tensor, int64_t b_lanes,
-                 int64_t split_k, const int rank, const int world_size, uint8_t* recv_buff, uint8_t* send_buff) {
+                 int64_t split_k, const int rank, const int world_size, uint8_t* buff_a, uint8_t* buff_b) {
     const int m = A.size(0);
     const int n = B.size(1);
     const int k = A.size(1);
@@ -209,8 +240,8 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     half* __restrict__ D_ = (half* __restrict__)D.data_ptr();
     float* __restrict__ scale_tensor_ = (float* __restrict__)scale_tensor.data_ptr();
 
-    half* __restrict__ recv_buff_ = (half* __restrict__)recv_buff;
-    half* __restrict__ send_buff_ = (half* __restrict__)send_buff;
+    half* __restrict__ buff_a_ = (half* __restrict__)buff_a;
+    half* __restrict__ buff_b_ = (half* __restrict__)buff_b;
 
     // Check shape
     if (m > WARPTILE_M) {
@@ -242,9 +273,15 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
             break;
     }
 
+    // switch (true) {
+    //     default:
+    //         launch_tsr(2, 3, 8, 1, 5);
+    // }
+
     //Reduction
+    cudaStreamSynchronize(stream);
     int threads = 256;
     int blocks = (D.numel() / 2 + threads - 1) / threads;
-    vectorized_reduce_inplace<<<blocks, threads, 0, stream>>>(D_, recv_buff_, send_buff_, D.numel(), rank, world_size);
+    vectorized_reduce_inplace<<<blocks, threads, 0, stream>>>(D_, buff_a_, buff_b_, D.numel(), rank, world_size);
     cudaStreamSynchronize(stream);
 }

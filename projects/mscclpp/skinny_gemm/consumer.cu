@@ -156,7 +156,7 @@ void __device__ _tsr_consumer(fp8* A_buffer, fp8* B_buffer, half* D, float scale
         x.y = __float2half_rn(reg_D[i][1]);
         asm volatile("global_atomic_pk_add_f16 %0, %1, off\n\t" : : "v"(&D_[i * OP_N / 2]), "v"(x));
         asm volatile("global_atomic_pk_add_f16 %0, %1, off\n\t" : : "v"(&scratch_[i * OP_N / 2]), "v"(x));
-        //D_[i * OP_N / 2] = 1;
+        //scratch_[i * OP_N / 2] = 1;
     }
 
     // TODO: add non atomic path if split-K == 1

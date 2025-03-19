@@ -10,7 +10,7 @@ setup(
             #'allreduce_cuda_kernel.cu',
         ],
         include_dirs=['/usr/local/mscclpp/include', "/opt/ompi/include"],  # Adjust this path
-        library_dirs=['/usr/local/mscclpp/lib', "/opt/ompi/lib"],      # Adjust this path
+        library_dirs=['/usr/local/mscclpp/lib', "/opt/ompi/lib", "/usr/local/lib"],      # Adjust this path
         libraries=['mscclpp', 'mpi'],
         #extra_compile_args=['-Xarch_gfx942'],
         extra_cuda_cflags=['-arch=gfx942'],

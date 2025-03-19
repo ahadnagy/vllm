@@ -117,6 +117,8 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
         
         print(f"Fused: {fused} \n")
         print(f"Pytorch: {torch} \n")
+        #torch.set_printoptions(profile="full")
+        #print(out)
         
     except Exception as e:
         print(f"Error on rank {rank}: {str(e)}")
@@ -125,7 +127,7 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
 def test_process():
     M = 8
     #N = 13312
-    N=13312
+    N=2304
     K = 16384
     B_LANES = 5
     SPLIT_K = 3

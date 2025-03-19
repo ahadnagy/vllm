@@ -35,11 +35,20 @@ public:
         // Setup mesh connections
         allocateCommsBuffers(D.numel() * D.element_size());
         printf("Allocated input buffers\n");
-        setupMeshConnections();
+        setupMeshConnections(channels_A_, comm_buff_A.get(), comm_buff_B.get(), comms_buff_bytes_);
+        CUDATHROW(cudaMemcpyToSymbol(constRingChannelsA, channels_A_.data(),
+            sizeof(DeviceHandle<mscclpp::PortChannel>) * channels_A_.size()));
+        printf("Copied channels to device\n");
+        setupMeshConnections(channels_B_, comm_buff_B.get(), comm_buff_A.get(), comms_buff_bytes_);
+        CUDATHROW(cudaMemcpyToSymbol(constRingChannelsB, channels_B_.data(),
+            sizeof(DeviceHandle<mscclpp::PortChannel>) * channels_B_.size()));
+        printf("Copied channels to device\n");
+
         printf("Setup mesh connections\n");
+        startProxy();
 
         CUDATHROW(cudaDeviceSynchronize());
-        skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, recv_buff_.get(), send_buff_.get());
+        skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, comm_buff_A.get(), comm_buff_B.get());
         CUDATHROW(cudaDeviceSynchronize());
         return D;
     }
@@ -73,19 +82,21 @@ private:
     }
 
     void allocateCommsBuffers(size_t bytes) {
-        recv_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
-        send_buff_ = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
+        comm_buff_A = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
+        comm_buff_B = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
         comms_buff_bytes_ = bytes;
     }
-
-    void setupMeshConnections() {
+    
+    void setupMeshConnections(std::vector<DeviceHandle<mscclpp::PortChannel>>& portChannels, void* send_buff, void* recv_buff, size_t buff_size) {
         mscclpp::Transport transport = mscclpp::Transport::CudaIpc;
         std::vector<mscclpp::NonblockingFuture<mscclpp::RegisteredMemory>> remoteRegMemories;
         std::vector<mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>> connectionFutures;
+        std::vector<std::shared_ptr<mscclpp::Connection>> connections;
 
         printf("Rank %d: Setting up mesh connections\n", rank_);
-        mscclpp::RegisteredMemory recvBufRegMem = communicator_->registerMemory(recv_buff_.get(), comms_buff_bytes_, transport);
-        mscclpp::RegisteredMemory sendBufRegMem = communicator_->registerMemory(send_buff_.get(), comms_buff_bytes_, transport);
+        mscclpp::RegisteredMemory recvBufRegMem = communicator_->registerMemory(recv_buff, buff_size, transport);
+        mscclpp::RegisteredMemory sendBufRegMem = communicator_->registerMemory(send_buff, buff_size, transport);
+        //mscclpp::RegisteredMemory bufRegMem = communicator_->registerMemory(buff, buff_size, transport);
         printf("Registered memory\n");
 
         // Connect with all other ranks
@@ -102,27 +113,24 @@ private:
         printf("Setup communicator\n");
 
         std::transform(
-            connectionFutures.begin(), connectionFutures.end(), std::back_inserter(connections_),
+            connectionFutures.begin(), connectionFutures.end(), std::back_inserter(connections),
             [](const mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>& future) { return future.get(); });
         printf("Got connections\n");
 
 
         auto service = std::dynamic_pointer_cast<mscclpp::ProxyService>(chanService_);
-        for (size_t i = 0; i < connections_.size(); ++i) {
-            channels_.push_back(mscclpp::deviceHandle(
-                service->portChannel(service->buildAndAddSemaphore(*communicator_, connections_[i]),
+        for (size_t i = 0; i < connections.size(); ++i) {
+            portChannels.push_back(mscclpp::deviceHandle(
+                service->portChannel(service->buildAndAddSemaphore(*communicator_, connections[i]),
                                      service->addMemory(remoteRegMemories[i].get()), service->addMemory(sendBufRegMem))));
         }
 
-        printf("Created channels: %d\n", channels_.size());
+        printf("Created channels: %d\n", portChannels.size());
 
         communicator_->setup();
+    }
 
-        CUDATHROW(cudaMemcpyToSymbol(constRingChannels, channels_.data(),
-                                 sizeof(DeviceHandle<mscclpp::PortChannel>) * channels_.size()));
-
-        printf("Copied channels to device\n");
-
+    void startProxy() {
         this->chanService_->startProxy();
         communicator_->bootstrap()->barrier();
         printf("Started proxy\n");
@@ -132,13 +140,13 @@ private:
     int rank_;
     int worldSize_;
     std::shared_ptr<mscclpp::Communicator> communicator_;
-    std::vector<DeviceHandle<mscclpp::PortChannel>> channels_;
-    std::vector<std::shared_ptr<mscclpp::Connection>> connections_;
+    std::vector<DeviceHandle<mscclpp::PortChannel>> channels_A_;
+    std::vector<DeviceHandle<mscclpp::PortChannel>> channels_B_;
     std::shared_ptr<mscclpp::BaseProxyService> chanService_;
     cudaStream_t stream_;
 
-    std::shared_ptr<uint8_t> recv_buff_;
-    std::shared_ptr<uint8_t> send_buff_;
+    std::shared_ptr<uint8_t> comm_buff_A;
+    std::shared_ptr<uint8_t> comm_buff_B;
     size_t comms_buff_bytes_;
 };
 
