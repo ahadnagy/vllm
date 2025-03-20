@@ -28,10 +28,6 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
     DeviceHandle<mscclpp::PortChannel>& left_b = constRingChannelsB[peerRecvId];
     DeviceHandle<mscclpp::PortChannel>& right_b = constRingChannelsB[peerSendId];
 
-    if(idx==0)
-        left_a.wait();
-    deviceSyncer.sync(gridDim.x, -1);
-
     // Ring all-reduce
     for (int step = 0; step < world_size - 1; ++step) {
         if (idx == 0) {
@@ -64,8 +60,6 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
             D[size - 1] = __hadd(D[size - 1], b);
         }
 
-        // Kick data around the ring
-        // TODO: implement double buffering (double comm channels)
         deviceSyncer.sync(gridDim.x, -1);
         if (idx == 0) {
             if (step % 2 == 0) {
@@ -79,40 +73,6 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
             }
         }
         deviceSyncer.sync(gridDim.x, -1);
-    //     int peerSendRank = (rank + 1) % world_size;
-    //     int peerRecvRank = (rank - 1 + world_size) % world_size;
-    //     int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
-    //     int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
-    //     DeviceHandle<mscclpp::PortChannel>& left = constRingChannels[peerRecvId];
-    //     DeviceHandle<mscclpp::PortChannel>& right = constRingChannels[peerSendId];
-    //     if (idx == 0) {
-    //         if (rank == 0) {
-    //             // Rank 0 starts the communication by sending data
-    //             printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
-    //             right.put(0, size);
-    //             printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
-    //             right.signal();
-    //             printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
-    //             right.flush();
-    //             printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
-    //         }
-        
-    //         // All ranks (including rank 0) wait to receive data
-    //         printf("Allreduce Rank %d: Waiting to receive data from %d\n", rank, peerRecvRank);
-    //         left.wait();
-    //         printf("Allreduce Rank %d: Received data from %d\n", rank, peerRecvRank);
-        
-    //         // After receiving, ranks other than 0 send data to the next rank
-    //         if (rank != 0) {
-    //             printf("Allreduce Rank %d: Sending data to %d\n", rank, peerSendRank);
-    //             right.put(0, size);
-    //             printf("Allreduce Rank %d: put complete to %d\n", rank, peerSendRank);
-    //             right.signal();
-    //             printf("Allreduce Rank %d: signal complete to %d\n", rank, peerSendRank);
-    //             right.flush();
-    //             printf("Allreduce Rank %d: flush complete to %d\n", rank, peerSendRank);
-    //         }
-    //     }
      }
 }
 
@@ -216,14 +176,11 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
     deviceSyncer.sync(gridDim.x, -1);
     if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE && blockIdx.x == 0) {
         // Send the result around the ring, only one thread needs to do this.
-        // We must sync here to make sure no other thread submits
-        // after the signal&flush.
-        // Ideally, most of the transfers are alredy popped off the FIFO
-        // and processed by the time we get here.
+
         right.put(0, m*n*2);
         right.signal();
         right.flush();
-        //left.wait();
+        left.wait();
         //printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
     }
     deviceSyncer.sync(gridDim.x, -1);

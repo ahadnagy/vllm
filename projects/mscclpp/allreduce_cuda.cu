@@ -1,6 +1,6 @@
 #include <torch/extension.h>
 #include <vector>
-#include <mpi.h>
+//#include <mpi.h>
 #include <mscclpp/core.hpp>
 #include <mscclpp/utils.hpp>
 #include <mscclpp/port_channel.hpp>
