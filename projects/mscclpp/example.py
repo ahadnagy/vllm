@@ -7,7 +7,7 @@ import mscclpp_allreduce
 import os
 
 import torch.distributed as dist
-from hf_rocm_kernels import skinny_gemm
+#from hf_rocm_kernels import skinny_gemm
 
 import timeit
 
@@ -83,6 +83,7 @@ def generate_skinny_gemm_data(
         torch.manual_seed(seed)
     scale_tensor = torch.ones(size=(1,), device="cuda", dtype=torch.float32).mul(2).add(1)
     skinny_a = fp8_quantize(
+        #torch.ones(size=(m, k), device="cuda", dtype=torch.float32),
         torch.ones(size=(m, k), device="cuda", dtype=torch.float32),
         scale_tensor,
     )[0]
@@ -106,34 +107,36 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
         print("out_size: ", out.shape)
         
         # Create AllReduce instance
-        allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size)
+        comms_a = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
+        comms_b = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
+        allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size, 50004, comms_a, comms_b)
         
         # Perform reduction
-        #allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
+        allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes, False)
         #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
         
-        start_torch = torch.cuda.Event(enable_timing=True)
-        end_torch = torch.cuda.Event(enable_timing=True)
-        start_fused = torch.cuda.Event(enable_timing=True)
-        end_fused = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
+        #start_torch = torch.cuda.Event(enable_timing=True)
+        #end_torch = torch.cuda.Event(enable_timing=True)
+        #start_fused = torch.cuda.Event(enable_timing=True)
+        #end_fused = torch.cuda.Event(enable_timing=True)
+        #torch.cuda.synchronize()
         
-        start_fused.record()
+        #start_fused.record()
         #fused = timeit.timeit(lambda: allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes), number=1)
-        allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
-        end_fused.record()
-        torch.cuda.synchronize()
-        start_torch.record()
+        #allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
+        #end_fused.record()
+        #torch.cuda.synchronize()
+        #start_torch.record()
         #torch = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=1)
-        skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
-        end_torch.record()
+        #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
+        #end_torch.record()
         
         #print(f"Fused: {fused} \n")
         #print(f"Pytorch: {torch} \n")
-        print(f"Fused: {start_fused.elapsed_time(end_fused)} \n")
-        print(f"Pytorch: {start_torch.elapsed_time(end_torch)} \n")
+        #print(f"Fused: {start_fused.elapsed_time(end_fused)} \n")
+        #print(f"Pytorch: {start_torch.elapsed_time(end_torch)} \n")
         #torch.set_printoptions(profile="full")
-        #print(out)
+        print(out)
         
     except Exception as e:
         print(f"Error on rank {rank}: {str(e)}")
@@ -142,8 +145,10 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
 def test_process():
     M = 8
     #N = 13312
-    N=2304
+    N = 16384
     K = 16384
+    #N = 16
+    #K = 256
     B_LANES = 5
     SPLIT_K = 3
     
