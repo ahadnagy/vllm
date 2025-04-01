@@ -228,7 +228,7 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
 
     // Launch kernel (branched on B_LANES)
-    cudaEventSynchronize(lock);
+    //cudaEventSynchronize(lock);
 
     cudaStreamCaptureStatus status;
     cudaError_t err = cudaStreamIsCapturing(stream, &status);
@@ -237,8 +237,9 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     }
     //bool is_capturing = (status != hipStreamCaptureStatusNone);
 
-    printf("capturing state: %d\n", status);
-    printf("capturing: %d\n", is_capturing);
+    //printf("capturing state: %d\n", status);
+    //printf("current stream: %p\n", stream);
+    //printf("capturing: %d\n", is_capturing);
 
     switch (b_lanes) {
         case 2:
@@ -257,6 +258,7 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     int blocks = (D.numel() / 2 + threads - 1) / threads;
     //printf("Allreduce: sizes: %d %d %d %d %d %d\n", D.numel(), m, n, k, m*n, m*n*2);
     vectorized_reduce_inplace<<<blocks, threads, 0, stream>>>(D_, buff_a_, buff_b_, D.numel(), rank, world_size, is_capturing);
-    cudaEventRecord(lock, stream);
-    cudaStreamSynchronize(stream);
+    //cudaEventRecord(lock, stream);
+    //cudaStreamSynchronize(stream);
+    //cudaDeviceSynchronize();
 }

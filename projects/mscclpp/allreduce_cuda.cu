@@ -32,8 +32,8 @@ public:
         printf("Setup mesh connections\n");
         startProxy();
 
-        cudaEventCreate(&allreduce_lock_event);
-        cudaEventRecord(allreduce_lock_event, at::cuda::getCurrentCUDAStream());
+        //cudaEventCreate(&allreduce_lock_event);
+        //cudaEventRecord(allreduce_lock_event, at::cuda::getCurrentCUDAStream());
     }
 
     ~AllReduceEngine() {
