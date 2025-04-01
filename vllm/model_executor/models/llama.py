@@ -66,7 +66,7 @@ from vllm.distributed.parallel_state import CustomComms
 from hf_rocm_kernels import residual_rms, skinny_gemm, swiglu
 
 
-custom_comms = None
+fused_gemm_comm = None
 comms_buff_A = None
 comms_buff_B = None
 
@@ -123,8 +123,8 @@ class LlamaMLP(nn.Module):
             x, _ = self.down_proj(x)
         else:
             out = torch.zeros(x.size(0), 16384, dtype=torch.float16, device=x.device)
-            global custom_comms
-            custom_comms.reduce(x, self.down_proj.weight, out, self.down_proj.input_scale*self.down_proj.weight_scale, 1, 4)
+            global fused_gemm_comm
+            fused_gemm_comm.reduce(x, self.down_proj.weight, out, self.down_proj.input_scale*self.down_proj.weight_scale, 1, 4)
             x = out
         return x
 
@@ -261,8 +261,8 @@ class LlamaAttention(nn.Module):
             output, _ = self.o_proj(attn_output)
         else:
             out = torch.zeros(attn_output.size(0), 16384, dtype=torch.float16, device=attn_output.device)
-            global custom_comms
-            custom_comms.reduce(attn_output, self.o_proj.weight, out, self.o_proj.input_scale*self.o_proj.weight_scale, 1, 4)
+            global fused_gemm_comm
+            fused_gemm_comm.reduce(attn_output, self.o_proj.weight, out, self.o_proj.input_scale*self.o_proj.weight_scale, 1, 4)
             output = out
         return output
 
@@ -583,13 +583,13 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         
         
         print("Starting custom comms initialization")
-        global custom_comms
+        global fused_gemm_comm
         global comms_buff_A
         global comms_buff_B
         comms_buff_A = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
         comms_buff_B = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
-        custom_comms = get_tp_group().verycustom_comm
-        custom_comms.actual_init(torch.distributed.get_rank(group=None), 8, 50001, comms_buff_A, comms_buff_B)
+        fused_gemm_comm = get_tp_group().fused_gemm_comm
+        fused_gemm_comm.engine_init(torch.distributed.get_rank(group=None), 8, 50001, comms_buff_A, comms_buff_B)
         print("Custom comms initialized")
 
         if get_pp_group().is_last_rank:

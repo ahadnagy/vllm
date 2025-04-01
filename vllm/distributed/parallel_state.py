@@ -59,11 +59,10 @@ class CustomComms:
     def __init__(self):
         self.capturing = False
         
-    def actual_init(self, rank: int, world_size: int, comms_id: int, buff_a: torch.Tensor, buff_b: torch.Tensor):
+    def engine_init(self, rank: int, world_size: int, comms_id: int, buff_a: torch.Tensor, buff_b: torch.Tensor):
         self.engine = mscclpp_allreduce.AllReduceEngine(rank, world_size, comms_id, buff_a, buff_b)
         
     def reduce(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, scale_tensor: torch.Tensor, split_k: int, b_lanes: int):
-        #global cuda_capture_global
         self.engine.reduce(a, b, out, scale_tensor, split_k, b_lanes, self.capturing)
         
     @contextmanager
@@ -179,7 +178,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
-    verycustom_comm: Optional[Any]
+    fused_gemm_comm: Optional[Any]
 
     def __init__(
         self,
@@ -252,7 +251,7 @@ class GroupCoordinator:
                 device=self.device,
             )
             
-        self.verycustom_comm = CustomComms()
+        self.fused_gemm_comm = CustomComms()
 
         from vllm.distributed.device_communicators.tpu_communicator import (
             TpuCommunicator)
@@ -322,7 +321,7 @@ class GroupCoordinator:
         else:
             stream = graph_capture_context.stream
 
-        verycustomcomm_context = self.verycustom_comm.capture()
+        fused_gemm_comm_context = self.fused_gemm_comm.capture()
 
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext(
@@ -335,7 +334,7 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context, verycustomcomm_context:
+        with torch.cuda.stream(stream), maybe_ca_context, fused_gemm_comm_context:
             pynccl_comm = self.pynccl_comm
             maybe_pynccl_context: Any
             if not pynccl_comm:

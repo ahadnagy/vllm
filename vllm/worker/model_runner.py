@@ -992,8 +992,6 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             prompt_adapter_mapping=prompt_adapter_mapping,
             prompt_adapter_requests=prompt_adapter_requests)
 
-cuda_capture_global = False
-
 class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     """
     Helper class for shared methods between GPU model runners.
@@ -1493,8 +1491,6 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                             is_encoder_decoder))
                     # Disable KV Scale Calculation for graph capture
                     attn_metadata.enable_kv_scales_calculation = False
-                    global cuda_capture_global
-                    cuda_capture_global = True
                     if self.lora_config:
                         lora_mapping = LoRAMapping(
                             **dict(index_mapping=[0] * batch_size,
@@ -1561,8 +1557,6 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
         # This usually takes < 10 seconds.
-        global cuda_capture_global
-        cuda_capture_global = False
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / GiB_bytes)
 
