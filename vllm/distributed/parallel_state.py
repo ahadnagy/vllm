@@ -46,11 +46,33 @@ from vllm.utils import (current_stream, direct_register_custom_op,
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    
+    
+import mscclpp_allreduce
 
 
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+    
+class CustomComms:
+    def __init__(self):
+        self.capturing = False
+        
+    def actual_init(self, rank: int, world_size: int, comms_id: int, buff_a: torch.Tensor, buff_b: torch.Tensor):
+        self.engine = mscclpp_allreduce.AllReduceEngine(rank, world_size, comms_id, buff_a, buff_b)
+        
+    def reduce(self, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, scale_tensor: torch.Tensor, split_k: int, b_lanes: int):
+        #global cuda_capture_global
+        self.engine.reduce(a, b, out, scale_tensor, split_k, b_lanes, self.capturing)
+        
+    @contextmanager
+    def capture(self):
+        try:
+            self.capturing = True
+            yield
+        finally:
+            self.capturing = False
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -157,6 +179,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    verycustom_comm: Optional[Any]
 
     def __init__(
         self,
@@ -228,6 +251,8 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
             )
+            
+        self.verycustom_comm = CustomComms()
 
         from vllm.distributed.device_communicators.tpu_communicator import (
             TpuCommunicator)
@@ -297,9 +322,12 @@ class GroupCoordinator:
         else:
             stream = graph_capture_context.stream
 
+        verycustomcomm_context = self.verycustom_comm.capture()
+
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext(
         ) if ca_comm is None else ca_comm.capture()
+        
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -307,7 +335,7 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
+        with torch.cuda.stream(stream), maybe_ca_context, verycustomcomm_context:
             pynccl_comm = self.pynccl_comm
             maybe_pynccl_context: Any
             if not pynccl_comm:

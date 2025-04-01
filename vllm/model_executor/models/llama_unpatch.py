@@ -57,18 +57,13 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
-from vllm.distributed.parallel_state import get_tp_group
+
+#import mscclpp_allreduce
 
 
-import mscclpp_allreduce
-
-from vllm.distributed.parallel_state import CustomComms
-from hf_rocm_kernels import residual_rms, skinny_gemm, swiglu
-
-
-custom_comms = None
-comms_buff_A = None
-comms_buff_B = None
+#custom_comms = None
+#comms_buff_A = None
+#comms_buff_B = None
 
 class LlamaMLP(nn.Module):
 
@@ -114,18 +109,17 @@ class LlamaMLP(nn.Module):
                           out, 8)
             x = out.view(x.shape[0], x.shape[1], out.shape[1])
         else:
-            x, _ = self.gate_up_proj(x.contiguous())
-            x = swiglu(x, self.down_proj.input_scale)
-            #x = self.act_fn(
-            #    x, self.down_proj.input_scale if self.use_fp8 else None)
-        #x, _ = self.down_proj(x)
-        if(x.size(0) > 8):
-            x, _ = self.down_proj(x)
-        else:
-            out = torch.zeros(x.size(0), 16384, dtype=torch.float16, device=x.device)
-            global custom_comms
-            custom_comms.reduce(x, self.down_proj.weight, out, self.down_proj.input_scale*self.down_proj.weight_scale, 1, 4)
-            x = out
+            x, _ = self.gate_up_proj(x)
+            x = self.act_fn(
+                x, self.down_proj.input_scale if self.use_fp8 else None)
+        x, _ = self.down_proj(x)
+        # if(x.size(0) > 8):
+        #     x, _ = self.down_proj(x)
+        # else:
+        #     out = torch.zeros(x.size(0), 16384, dtype=torch.float16, device=x.device)
+        #     global custom_comms
+        #     custom_comms.reduce(x, self.down_proj.weight, out, self.down_proj.input_scale*self.down_proj.weight_scale, 1, 4, torch.cuda.is_current_stream_capturing())
+        #     x = out
         return x
 
 
@@ -238,32 +232,21 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        qkv_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if hidden_states.size(0) <= 8:
-            qkv = skinny_gemm(
-                skinny_a=hidden_states,
-                b=self.qkv_proj.weight,
-                scale_tensor=self.qkv_proj.combined_scale,
-                output=qkv_buffer,
-                split_k=9,
-                b_lanes=5,
-            )
-        else:
-            qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(
             q, k, v, kv_cache, attn_metadata,
             self.o_proj.input_scale if self.attn_fp8_out else None)
-        #output, _ = self.o_proj(attn_output)
-        if(attn_output.size(0) > 8):
-            output, _ = self.o_proj(attn_output)
-        else:
-            out = torch.zeros(attn_output.size(0), 16384, dtype=torch.float16, device=attn_output.device)
-            global custom_comms
-            custom_comms.reduce(attn_output, self.o_proj.weight, out, self.o_proj.input_scale*self.o_proj.weight_scale, 1, 4)
-            output = out
+        output, _ = self.o_proj(attn_output)
+        # if(attn_output.size(0) > 8):
+        #     output, _ = self.o_proj(attn_output)
+        # else:
+        #     out = torch.zeros(attn_output.size(0), 16384, dtype=torch.float16, device=attn_output.device)
+        #     global custom_comms
+        #     custom_comms.reduce(attn_output, self.o_proj.weight, out, self.o_proj.input_scale*self.o_proj.weight_scale, 1, 4, torch.cuda.is_current_stream_capturing())
+        #     output = out
         return output
 
 
@@ -337,29 +320,12 @@ class LlamaDecoderLayer(nn.Module):
         # Self Attention
         scale = None if not self.use_fp8 else \
             self.self_attn.qkv_proj.input_scale
-            
-        qkv_buffer = None
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states, None, scale)
         else:
-            if hidden_states.size(0) <= 8:
-                qkv_buffer = torch.empty(
-                    size=(hidden_states.size(0), self.self_attn.qkv_proj.weight.size(1)),
-                    dtype=torch.float16,
-                    device=hidden_states.device,
-                )
-            hidden_states, _ = residual_rms(
-                input=hidden_states,
-                residual=residual,
-                weight=self.input_layernorm.weight,
-                epsilon=self.input_layernorm.variance_epsilon,
-                scale_tensor=scale,
-                next_buffer=qkv_buffer,
-            )
-            #hidden_states, residual = self.input_layernorm(
-            #    hidden_states, residual, scale)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, scale)
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
                                        kv_cache=kv_cache,
@@ -367,15 +333,8 @@ class LlamaDecoderLayer(nn.Module):
 
         # Fully Connected
         scale = None if not self.use_fp8 else self.mlp.gate_up_proj.input_scale
-        hidden_states, _ = residual_rms(
-                input=hidden_states,
-                residual=residual,
-                weight=self.post_attention_layernorm.weight,
-                epsilon=self.post_attention_layernorm.variance_epsilon,
-                scale_tensor=self.mlp.gate_up_proj.input_scale,
-            )
-        #hidden_states, residual = self.post_attention_layernorm(
-        #    hidden_states, residual, scale)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, scale)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -582,15 +541,14 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                                       prefix=maybe_prefix(prefix, "model"))
         
         
-        print("Starting custom comms initialization")
-        global custom_comms
-        global comms_buff_A
-        global comms_buff_B
-        comms_buff_A = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
-        comms_buff_B = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
-        custom_comms = get_tp_group().verycustom_comm
-        custom_comms.actual_init(torch.distributed.get_rank(group=None), 8, 50001, comms_buff_A, comms_buff_B)
-        print("Custom comms initialized")
+        # print("Starting custom comms initialization")
+        # global custom_comms
+        # global comms_buff_A
+        # global comms_buff_B
+        # comms_buff_A = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
+        # comms_buff_B = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
+        # custom_comms = mscclpp_allreduce.AllReduceEngine(torch.distributed.get_rank(group=None), 8, 50001, comms_buff_A, comms_buff_B)
+        # print("Custom comms initialized")
 
         if get_pp_group().is_last_rank:
             self.unpadded_vocab_size = config.vocab_size

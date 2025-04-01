@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
@@ -20,7 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Type, Union
 
 import torch
 from torch import nn
@@ -28,7 +30,7 @@ from transformers import LlamaConfig
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm.attention import Attention, AttentionMetadata
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -40,6 +42,7 @@ from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -57,18 +60,10 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
-from vllm.distributed.parallel_state import get_tp_group
-
-
-import mscclpp_allreduce
-
-from vllm.distributed.parallel_state import CustomComms
-from hf_rocm_kernels import residual_rms, skinny_gemm, swiglu
+#import mscclpp_allreduce
 
 
 custom_comms = None
-comms_buff_A = None
-comms_buff_B = None
 
 class LlamaMLP(nn.Module):
 
@@ -96,7 +91,9 @@ class LlamaMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        self.use_fp8 = (isinstance(quant_config, Fp8Config)
+        self.use_fp8 = (isinstance(quant_config, Fp8Config) or
+                        (isinstance(quant_config, QuarkConfig)
+                         and quant_config.is_fp8_w8a8())
                         if current_platform.is_rocm() and not is_navi() else
                         False)
         if hidden_act != "silu":
@@ -114,18 +111,16 @@ class LlamaMLP(nn.Module):
                           out, 8)
             x = out.view(x.shape[0], x.shape[1], out.shape[1])
         else:
-            x, _ = self.gate_up_proj(x.contiguous())
-            x = swiglu(x, self.down_proj.input_scale)
-            #x = self.act_fn(
-            #    x, self.down_proj.input_scale if self.use_fp8 else None)
-        #x, _ = self.down_proj(x)
-        if(x.size(0) > 8):
-            x, _ = self.down_proj(x)
-        else:
-            out = torch.zeros(x.size(0), 16384, dtype=torch.float16, device=x.device)
-            global custom_comms
-            custom_comms.reduce(x, self.down_proj.weight, out, self.down_proj.input_scale*self.down_proj.weight_scale, 1, 4)
-            x = out
+            x, _ = self.gate_up_proj(x)
+            x = self.act_fn(
+                x, self.down_proj.input_scale if self.use_fp8 else None)
+        x, _ = self.down_proj(x)
+        #if(x.size(0) > 8):
+        #    x, _ = self.down_proj(x)
+        #else:
+        #    out = torch.zeros(x.size(0), 16384, dtype=torch.float16, device=x.device)
+        #    allreduce.reduce(x, self.down_proj.weight, out, self.down_proj.input_scale*self.down_proj.weight_scale, 1, 4)
+        #    x = out
         return x
 
 
@@ -164,6 +159,9 @@ class LlamaAttention(nn.Module):
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
         self.head_dim = getattr(config, "head_dim",
                                 self.hidden_size // self.total_num_heads)
+        # Phi models introduced a partial_rotary_factor parameter in the config
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
+        self.rotary_dim = int(partial_rotary_factor * self.head_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -195,7 +193,7 @@ class LlamaAttention(nn.Module):
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
+            rotary_dim=self.rotary_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
@@ -216,10 +214,13 @@ class LlamaAttention(nn.Module):
             sliding_window = None
 
         # For CUDA devices and Navi4x, attn_fp8 will be set to false.
+        use_fp8 = isinstance(
+            quant_config, Fp8Config) or (isinstance(quant_config, QuarkConfig)
+                                         and quant_config.is_fp8_w8a8())
         self.attn_fp8_out = envs.VLLM_USE_ROCM_CUSTOM_PAGED_ATTN_FP8_OUT \
                         and current_platform.is_rocm() \
                         and not is_navi() \
-                        and isinstance(quant_config, Fp8Config)
+                        and use_fp8
 
         self.attn = Attention(
             self.num_heads,
@@ -236,34 +237,13 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        qkv_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if hidden_states.size(0) <= 8:
-            qkv = skinny_gemm(
-                skinny_a=hidden_states,
-                b=self.qkv_proj.weight,
-                scale_tensor=self.qkv_proj.combined_scale,
-                output=qkv_buffer,
-                split_k=9,
-                b_lanes=5,
-            )
-        else:
-            qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(
-            q, k, v, kv_cache, attn_metadata,
-            self.o_proj.input_scale if self.attn_fp8_out else None)
-        #output, _ = self.o_proj(attn_output)
-        if(attn_output.size(0) > 8):
-            output, _ = self.o_proj(attn_output)
-        else:
-            out = torch.zeros(attn_output.size(0), 16384, dtype=torch.float16, device=attn_output.device)
-            global custom_comms
-            custom_comms.reduce(attn_output, self.o_proj.weight, out, self.o_proj.input_scale*self.o_proj.weight_scale, 1, 4)
-            output = out
+            q, k, v, self.o_proj.input_scale if self.attn_fp8_out else None)
+        output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -278,7 +258,9 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.use_fp8 = (isinstance(quant_config, Fp8Config)
+        self.use_fp8 = (isinstance(quant_config, Fp8Config) or
+                        (isinstance(quant_config, QuarkConfig)
+                         and quant_config.is_fp8_w8a8())
                         if current_platform.is_rocm() and not is_navi() else
                         False)
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -330,52 +312,24 @@ class LlamaDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         scale = None if not self.use_fp8 else \
             self.self_attn.qkv_proj.input_scale
-            
-        qkv_buffer = None
-
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states, None, scale)
         else:
-            if hidden_states.size(0) <= 8:
-                qkv_buffer = torch.empty(
-                    size=(hidden_states.size(0), self.self_attn.qkv_proj.weight.size(1)),
-                    dtype=torch.float16,
-                    device=hidden_states.device,
-                )
-            hidden_states, _ = residual_rms(
-                input=hidden_states,
-                residual=residual,
-                weight=self.input_layernorm.weight,
-                epsilon=self.input_layernorm.variance_epsilon,
-                scale_tensor=scale,
-                next_buffer=qkv_buffer,
-            )
-            #hidden_states, residual = self.input_layernorm(
-            #    hidden_states, residual, scale)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, scale)
         hidden_states = self.self_attn(positions=positions,
-                                       hidden_states=hidden_states,
-                                       kv_cache=kv_cache,
-                                       attn_metadata=attn_metadata)
+                                       hidden_states=hidden_states)
 
         # Fully Connected
         scale = None if not self.use_fp8 else self.mlp.gate_up_proj.input_scale
-        hidden_states, _ = residual_rms(
-                input=hidden_states,
-                residual=residual,
-                weight=self.post_attention_layernorm.weight,
-                epsilon=self.post_attention_layernorm.variance_epsilon,
-                scale_tensor=self.mlp.gate_up_proj.input_scale,
-            )
-        #hidden_states, residual = self.post_attention_layernorm(
-        #    hidden_states, residual, scale)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual, scale)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -436,8 +390,6 @@ class LlamaModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -452,11 +404,8 @@ class LlamaModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches[i - self.start_layer],
-                                            attn_metadata, residual)
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -498,6 +447,11 @@ class LlamaModel(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
+            if "scale" in name:
+                # Remapping the name of FP8 kv-scale.
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -516,10 +470,6 @@ class LlamaModel(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
                     continue
 
                 if is_pp_missing_parameter(name, self):
@@ -540,10 +490,6 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     }
 
     # LoRA specific attributes
-    supported_lora_modules = [
-        "qkv_proj", "o_proj", "gate_up_proj", "down_proj", "embed_tokens",
-        "lm_head"
-    ]
     embedding_modules = {
         "embed_tokens": "input_embeddings",
         "lm_head": "output_embeddings"
@@ -555,6 +501,9 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     mistral_mapping = {
         "layers": "model.layers",
         "attention": "self_attn",
+        "qscale_act": "input_scale",
+        "qscale_weight": "weight_scale",
+        "kv_fake_quantizer.qscale_act": "kv_scale",
         "wq": "q_proj",
         "wk": "k_proj",
         "wv": "v_proj",
@@ -577,20 +526,13 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         lora_config = vllm_config.lora_config
         self.config = config
         self.lora_config = lora_config
+        
+        #print("Starting custom comms initialization")
+        #custom_comms = mscclpp_allreduce.AllReduceEngine(torch.distributed.get_rank(group=None), 8)
+        #print("Custom comms initialized")
 
         self.model = self._init_model(vllm_config=vllm_config,
                                       prefix=maybe_prefix(prefix, "model"))
-        
-        
-        print("Starting custom comms initialization")
-        global custom_comms
-        global comms_buff_A
-        global comms_buff_B
-        comms_buff_A = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
-        comms_buff_B = torch.empty(8, 16384, dtype=torch.float16, device=torch.cuda.current_device())
-        custom_comms = get_tp_group().verycustom_comm
-        custom_comms.actual_init(torch.distributed.get_rank(group=None), 8, 50001, comms_buff_A, comms_buff_B)
-        print("Custom comms initialized")
 
         if get_pp_group().is_last_rank:
             self.unpadded_vocab_size = config.vocab_size
@@ -635,13 +577,10 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        model_output = self.model(input_ids, positions, kv_caches,
-                                  attn_metadata, intermediate_tensors,
+        model_output = self.model(input_ids, positions, intermediate_tensors,
                                   inputs_embeds)
         return model_output
 
@@ -689,15 +628,24 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         modules = name.split(".")
 
         # rotary embeds should be sliced
-        if "wk" in modules:
+        if "wk" in modules and modules[-1] == "weight":
             loaded_weight = permute(loaded_weight,
                                     self.config.num_key_value_heads)
-        elif "wq" in modules:
+        elif "wq" in modules and modules[-1] == "weight":
             loaded_weight = permute(loaded_weight,
                                     self.config.num_attention_heads)
 
-        for item in modules:
-            if item in mapping and mapping[item] not in name:
+        num_modules = len(modules)
+        for i in range(num_modules):
+            item = modules[i]
+            next_item = modules[i + 1] if i < num_modules - 1 else None
+
+            combined_item = (f"{item}.{next_item}"
+                             if next_item is not None else None)
+
+            if combined_item in mapping:
+                name = name.replace(combined_item, mapping[combined_item])
+            elif item in mapping and mapping[item] not in name:
                 name = name.replace(item, mapping[item])
 
         return name, loaded_weight

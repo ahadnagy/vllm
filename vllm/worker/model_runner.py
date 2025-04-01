@@ -992,6 +992,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             prompt_adapter_mapping=prompt_adapter_mapping,
             prompt_adapter_requests=prompt_adapter_requests)
 
+cuda_capture_global = False
 
 class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     """
@@ -1492,6 +1493,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                             is_encoder_decoder))
                     # Disable KV Scale Calculation for graph capture
                     attn_metadata.enable_kv_scales_calculation = False
+                    global cuda_capture_global
+                    cuda_capture_global = True
                     if self.lora_config:
                         lora_mapping = LoRAMapping(
                             **dict(index_mapping=[0] * batch_size,
@@ -1558,6 +1561,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
         # This usually takes < 10 seconds.
+        global cuda_capture_global
+        cuda_capture_global = False
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / GiB_bytes)
 
@@ -1919,6 +1924,8 @@ class CUDAGraphRunner(nn.Module):
         # Graph Capture.
         torch.cuda.synchronize()
         # Capture the graph.
+        global cuda_capture_global
+        cuda_capture_global = True
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph, pool=memory_pool, stream=stream):
             output_hidden_or_intermediate_states = self.model(
@@ -1947,6 +1954,8 @@ class CUDAGraphRunner(nn.Module):
             # in the graph's memory pool
             gc.collect()
         torch.cuda.synchronize()
+        global cuda_capture_global
+        cuda_capture_global = False
 
         # Save the input and output buffers.
         self.input_buffers = {
