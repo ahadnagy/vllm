@@ -9,6 +9,9 @@ build/
 async_gemm_wide/
 grid_results/
 
-
+*.hip
+*.egg-info
+*.so
+dist
 *.egg-info/**
 .vscode/

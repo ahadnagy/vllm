@@ -15,7 +15,7 @@ public:
     AllReduceEngine(int rank, int worldSize,
                     int port,
                     torch::Tensor& comms_buff_A,
-                    torch::Tensor& comms_buff_B) 
+                    torch::Tensor& comms_buff_B)
         : rank_(rank), worldSize_(worldSize), comms_buff_A_(comms_buff_A.data_ptr()), comms_buff_B_(comms_buff_B.data_ptr()) {
         bootstrap(port);
         printf("Allocated input buffers\n");
@@ -52,7 +52,7 @@ public:
         bool is_capturing) {
         TORCH_CHECK(A.is_cuda(), "Input tensor must be a CUDA tensor");
         TORCH_CHECK(A.is_contiguous(), "Input tensor must be contiguous");
- 
+
         // Setup mesh connections
         //allocateCommsBuffers(D.numel() * D.element_size());
         // printf("Allocated input buffers\n");
@@ -69,9 +69,14 @@ public:
         // printf("Setup mesh connections\n");
         // startProxy();
 
-        //CUDATHROW(cudaDeviceSynchronize());
+        CUDATHROW(hipMemsetD16(reinterpret_cast<uint8_t *>(comms_buff_A_), 0, A.numel()));
+        CUDATHROW(hipMemsetD16(reinterpret_cast<uint8_t *>(comms_buff_B_), 0, A.numel()));
+        CUDATHROW(cudaDeviceSynchronize());
+        communicator_->bootstrap()->barrier();
+
         skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, reinterpret_cast<uint8_t *>(comms_buff_A_), reinterpret_cast<uint8_t *>(comms_buff_B_), allreduce_lock_event, is_capturing);
-        //CUDATHROW(cudaDeviceSynchronize());
+        CUDATHROW(cudaDeviceSynchronize());
+        communicator_->bootstrap()->barrier();
         return D;
     }
 
@@ -87,7 +92,7 @@ private:
 
         std::string ip_port = "localhost:";
         auto bootstrap = std::make_shared<mscclpp::TcpBootstrap>(rank_, worldSize_);
-        
+
         // Initialize with options
         //bootstrap->initialize(ip_port, options);
         //mscclpp::UniqueId id;
@@ -97,7 +102,7 @@ private:
         bootstrap->initialize(ip_port.append(std::to_string(port)));
         bootstrap->barrier();
         printf("Initialized comms\n");
-        
+
         // Create communicator and wait for all processes
         communicator_ = std::make_shared<mscclpp::Communicator>(bootstrap);
         chanService_ = std::make_shared<mscclpp::ProxyService>();
@@ -108,7 +113,7 @@ private:
         comm_buff_B = mscclpp::GpuBuffer<uint8_t>(bytes).memory();
         comms_buff_bytes_ = bytes;
     }
-    
+
     void setupMeshConnections(std::vector<DeviceHandle<mscclpp::PortChannel>>& portChannels, void* send_buff, void* recv_buff, size_t buff_size) {
         mscclpp::Transport transport = mscclpp::Transport::CudaIpc;
         std::vector<mscclpp::NonblockingFuture<mscclpp::RegisteredMemory>> remoteRegMemories;
@@ -181,4 +186,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<AllReduceEngine>(m, "AllReduceEngine")
         .def(py::init<int, int, int, torch::Tensor&, torch::Tensor&>())
         .def("reduce", &AllReduceEngine::reduce);
-} 
+}

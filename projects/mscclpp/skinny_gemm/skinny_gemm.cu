@@ -10,7 +10,7 @@ __constant__ DeviceHandle<mscclpp::PortChannel> constRingChannelsB[7];
 
 __device__ mscclpp::DeviceSyncer deviceSyncer;
 
-__global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* __restrict__ buff_a, __half* __restrict__ buff_b, int size, int rank, int world_size, bool is_capturing) {
+__global__ void vectorized_reduce_inplace(__half* __restrict__ D, __half* __restrict__ buff_a, __half* __restrict__ buff_b, int size, int rank, int world_size, bool is_capturing) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = gridDim.x * blockDim.x;
     using half2_t = __half2;
@@ -38,7 +38,7 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
                     right_b.put(0, size*2);
                     right_b.signal();
                 }
-                
+
             } else {
                 // Let's wait for the parallel transfer to complete (A->B)
                 //printf("Allreduce Rank %d: Sending data A->B to %d\n", rank, peerSendRank);
@@ -54,11 +54,11 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, const __half* 
         for (int i = idx * 2; i < size; i += stride * 2) {
             half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
             //const __half2* buff = step % 2 == 0 ? buff_a : buff_b;
-            half2_t b = reinterpret_cast<const half2_t*>(step % 2 == 0 ? buff_b : buff_a)[i / 2];
+            half2_t b = reinterpret_cast<half2_t*>(step % 2 == 0 ? buff_b : buff_a)[i / 2];
             //half2_t b = reinterpret_cast<const half2_t*>(buff_a)[i / 2];
             reinterpret_cast<half2_t*>(D)[i / 2] = __hadd2(a, b);  // In-place addition
         }
-    
+
         // Handle odd-length case (if n is odd)
         if (idx == 0 && (size % 2) != 0) {
             __half b = (step % 2 == 0 ? buff_b : buff_a)[size - 1];

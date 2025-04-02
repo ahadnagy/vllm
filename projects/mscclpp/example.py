@@ -28,10 +28,10 @@ def init_process(rank, world_size, master_addr):
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-    
+
     # Set device
     torch.cuda.set_device(rank)
-    
+
     return rank, world_size
 
 def allreduce_process(rank, world_size):
@@ -45,9 +45,9 @@ def test_nccl_allreduce():
     world_size = torch.cuda.device_count()
     if world_size < 2:
         pytest.skip("Test requires at least 2 GPUs")
-    
+
     mp.spawn(allreduce_process, args=(world_size,), nprocs=world_size, join=True)
-    
+
 def fp8_quantize(
     x_full_precision: Tensor,
     scale: Tensor,
@@ -69,11 +69,11 @@ def fp8_quantize(
     mask = weight_as_int8 == ROCM_FP8_NAN_AS_INT
     weight_as_int8[mask] = 0
     x_quantized = weight_as_int8.view(torch.float8_e4m3fnuz)
-    # For the same bits representation, e4m3fnuz value is half of the e4m3fn value, so we should double the scaling 
+    # For the same bits representation, e4m3fnuz value is half of the e4m3fn value, so we should double the scaling
     # factor to get the same dequantized value.
     return x_quantized, scale * 2.0
 
-    
+
 def generate_skinny_gemm_data(
     m: int, n: int, k: int, seed: Optional[int] = None
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -94,33 +94,35 @@ def generate_skinny_gemm_data(
     output = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
     return skinny_a, b, scale_tensor, output
 
+from time import sleep
 
 def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_lanes: int):
     """Test for the skinny_gemm operation."""
     try:
         # Initialize process
         rank, world_size = init_process(rank, world_size, "localhost")
-        
+
         # Generate data
         skinny_a, b, scale_tensor, out = generate_skinny_gemm_data(m, n, k, seed=0)
-        
+        skinny_a2, b2, scale_tensor2, out2 = generate_skinny_gemm_data(m, n, k, seed=0)
+
         print("out_size: ", out.shape)
-        
+
         # Create AllReduce instance
         comms_a = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
         comms_b = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
         allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size, 50004, comms_a, comms_b)
-        
+
         # Perform reduction
         allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes, False)
         #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
-        
+
         #start_torch = torch.cuda.Event(enable_timing=True)
         #end_torch = torch.cuda.Event(enable_timing=True)
         #start_fused = torch.cuda.Event(enable_timing=True)
         #end_fused = torch.cuda.Event(enable_timing=True)
         #torch.cuda.synchronize()
-        
+
         #start_fused.record()
         #fused = timeit.timeit(lambda: allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes), number=1)
         #allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
@@ -130,17 +132,24 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
         #torch = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=1)
         #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
         #end_torch.record()
-        
+
         #print(f"Fused: {fused} \n")
         #print(f"Pytorch: {torch} \n")
         #print(f"Fused: {start_fused.elapsed_time(end_fused)} \n")
         #print(f"Pytorch: {start_torch.elapsed_time(end_torch)} \n")
         #torch.set_printoptions(profile="full")
-        print(out)
-        
+        print("out", out)
+        print("comms_a", comms_a)
+        print("comms_b", comms_b)
+
+        allreduce.reduce(skinny_a2, b2, out2, scale_tensor2, split_k, b_lanes, False)
+        print("out2", out2)
+
     except Exception as e:
         print(f"Error on rank {rank}: {str(e)}")
         raise
+    finally:
+        dist.destroy_process_group()
 
 def test_process():
     M = 8
@@ -151,12 +160,12 @@ def test_process():
     #K = 256
     B_LANES = 5
     SPLIT_K = 3
-    
+
     # Use all available GPUs
     world_size = torch.cuda.device_count()
     if world_size < 1:
         raise RuntimeError("No CUDA devices available")
-    
+
     # Start multiple processes
     mp.spawn(
         _benchmark_skinny_gemm,
