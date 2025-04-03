@@ -17,14 +17,19 @@ public:
                     torch::Tensor& comms_buff_A,
                     torch::Tensor& comms_buff_B)
         : rank_(rank), worldSize_(worldSize), comms_buff_A_(comms_buff_A.data_ptr()), comms_buff_B_(comms_buff_B.data_ptr()) {
+        mscclpp::Transport transport = mscclpp::Transport::CudaIpc;
         bootstrap(port);
-        printf("Allocated input buffers\n");
+
         comms_buff_bytes_ = comms_buff_A.numel() * comms_buff_A.element_size();
-        setupMeshConnections(channels_A_, comms_buff_A.data_ptr(), comms_buff_B.data_ptr(), comms_buff_bytes_);
+        registered_buff_A_ = communicator_->registerMemory(comms_buff_A.data_ptr(), comms_buff_bytes_, transport);
+        registered_buff_B_ = communicator_->registerMemory(comms_buff_B.data_ptr(), comms_buff_bytes_, transport);
+        printf("Registered memory\n");
+
+        setupMeshConnections(channels_A_, registered_buff_A_, registered_buff_B_, comms_buff_bytes_, 0);
         CUDATHROW(cudaMemcpyToSymbol(constRingChannelsA, channels_A_.data(),
             sizeof(DeviceHandle<mscclpp::PortChannel>) * channels_A_.size()));
         printf("Copied channels to device\n");
-        setupMeshConnections(channels_B_, comms_buff_B.data_ptr(), comms_buff_A.data_ptr(), comms_buff_bytes_);
+        setupMeshConnections(channels_B_, registered_buff_B_, registered_buff_A_, comms_buff_bytes_, 1);
         CUDATHROW(cudaMemcpyToSymbol(constRingChannelsB, channels_B_.data(),
             sizeof(DeviceHandle<mscclpp::PortChannel>) * channels_B_.size()));
         printf("Copied channels to device\n");
@@ -69,13 +74,13 @@ public:
         // printf("Setup mesh connections\n");
         // startProxy();
 
-        CUDATHROW(hipMemsetD16(reinterpret_cast<uint8_t *>(comms_buff_A_), 0, A.numel()));
-        CUDATHROW(hipMemsetD16(reinterpret_cast<uint8_t *>(comms_buff_B_), 0, A.numel()));
-        CUDATHROW(cudaDeviceSynchronize());
+        //CUDATHROW(hipMemsetD16(reinterpret_cast<uint8_t *>(comms_buff_A_), 0, A.numel()));
+        //CUDATHROW(hipMemsetD16(reinterpret_cast<uint8_t *>(comms_buff_B_), 0, A.numel()));
+        //CUDATHROW(cudaDeviceSynchronize());
         communicator_->bootstrap()->barrier();
 
         skinny_gemm(A, B, D, scale_tensor, b_lanes, split_k, rank_, worldSize_, reinterpret_cast<uint8_t *>(comms_buff_A_), reinterpret_cast<uint8_t *>(comms_buff_B_), allreduce_lock_event, is_capturing);
-        CUDATHROW(cudaDeviceSynchronize());
+        //CUDATHROW(cudaDeviceSynchronize());
         communicator_->bootstrap()->barrier();
         return D;
     }
@@ -114,24 +119,24 @@ private:
         comms_buff_bytes_ = bytes;
     }
 
-    void setupMeshConnections(std::vector<DeviceHandle<mscclpp::PortChannel>>& portChannels, void* send_buff, void* recv_buff, size_t buff_size) {
+    void setupMeshConnections(std::vector<DeviceHandle<mscclpp::PortChannel>>& portChannels, mscclpp::RegisteredMemory& sendBufRegMem, mscclpp::RegisteredMemory& recvBufRegMem, size_t buff_size, int tag = 0) {
         mscclpp::Transport transport = mscclpp::Transport::CudaIpc;
         std::vector<mscclpp::NonblockingFuture<mscclpp::RegisteredMemory>> remoteRegMemories;
         std::vector<mscclpp::NonblockingFuture<std::shared_ptr<mscclpp::Connection>>> connectionFutures;
         std::vector<std::shared_ptr<mscclpp::Connection>> connections;
 
         printf("Rank %d: Setting up mesh connections\n", rank_);
-        mscclpp::RegisteredMemory recvBufRegMem = communicator_->registerMemory(recv_buff, buff_size, transport);
-        mscclpp::RegisteredMemory sendBufRegMem = communicator_->registerMemory(send_buff, buff_size, transport);
+        //mscclpp::RegisteredMemory recvBufRegMem = communicator_->registerMemory(recv_buff, buff_size, transport);
+        //mscclpp::RegisteredMemory sendBufRegMem = communicator_->registerMemory(send_buff, buff_size, transport);
         //mscclpp::RegisteredMemory bufRegMem = communicator_->registerMemory(buff, buff_size, transport);
-        printf("Registered memory\n");
+        
 
         // Connect with all other ranks
         for (int r = 0; r < worldSize_; ++r) {
             if (r == rank_) continue;
-            connectionFutures.push_back(communicator_->connectOnSetup(r, 0, transport));
-            communicator_->sendMemoryOnSetup(recvBufRegMem, r, 0);
-            remoteRegMemories.push_back(communicator_->recvMemoryOnSetup(r, 0));
+            connectionFutures.push_back(communicator_->connectOnSetup(r, tag, transport));
+            communicator_->sendMemoryOnSetup(recvBufRegMem, r, tag);
+            remoteRegMemories.push_back(communicator_->recvMemoryOnSetup(r, tag));
         }
         printf("Connected with all other ranks\n");
 
@@ -174,6 +179,9 @@ private:
 
     std::shared_ptr<uint8_t> comm_buff_A;
     std::shared_ptr<uint8_t> comm_buff_B;
+
+    mscclpp::RegisteredMemory registered_buff_A_;
+    mscclpp::RegisteredMemory registered_buff_B_;
 
     void* comms_buff_A_;
     void* comms_buff_B_;
