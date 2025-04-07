@@ -1,12 +1,13 @@
 #include "./consumer.cu"
 #include "./producer.cu"
 #include <mscclpp/concurrency_device.hpp>
+#include <mscclpp/packet_device.hpp>
 
 
 template <class T>
 using DeviceHandle = mscclpp::DeviceHandle<T>;
-__constant__ DeviceHandle<mscclpp::PortChannel> constRingChannelsA[7];
-__constant__ DeviceHandle<mscclpp::PortChannel> constRingChannelsB[7];
+__constant__ DeviceHandle<mscclpp::MemoryChannel> constRingChannelsA[7];
+__constant__ DeviceHandle<mscclpp::MemoryChannel> constRingChannelsB[7];
 
 __device__ mscclpp::DeviceSyncer deviceSyncer;
 
@@ -22,32 +23,40 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, __half* __rest
     int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
     int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
 
-    DeviceHandle<mscclpp::PortChannel>& left_a = constRingChannelsA[peerRecvId];
-    DeviceHandle<mscclpp::PortChannel>& right_a = constRingChannelsA[peerSendId];
+    DeviceHandle<mscclpp::MemoryChannel>& left_a = constRingChannelsA[peerRecvId];
+    DeviceHandle<mscclpp::MemoryChannel>& right_a = constRingChannelsA[peerSendId];
 
-    DeviceHandle<mscclpp::PortChannel>& left_b = constRingChannelsB[peerRecvId];
-    DeviceHandle<mscclpp::PortChannel>& right_b = constRingChannelsB[peerSendId];
+    DeviceHandle<mscclpp::MemoryChannel>& left_b = constRingChannelsB[peerRecvId];
+    DeviceHandle<mscclpp::MemoryChannel>& right_b = constRingChannelsB[peerSendId];
 
     // Ring all-reduce
     for (int step = 0; step < world_size - 1; ++step) {
         if (idx == 0) {
             if (step % 2 == 0) {
                 // Let's wait for the parallel transfer to complete (B->A)
-                //printf("Allreduce Rank %d: Sending data B->A to %d\n", rank, peerSendRank);
+                //printf("Allreduce Rank %d: Sending data B->A to %d, round %d\n", rank, peerSendRank, step);
                 if(!is_capturing) {
-                    right_b.put(0, size*2);
+                    //left_b.signal();
+                    //left_b.flush();
+                    //right_b.wait();
+                    //right_b.put(0, size*2);
+                    right_b.put(0, size*2, 0, 1);
                     right_b.signal();
                 }
-
             } else {
                 // Let's wait for the parallel transfer to complete (A->B)
-                //printf("Allreduce Rank %d: Sending data A->B to %d\n", rank, peerSendRank);
+                //printf("Allreduce Rank %d: Sending data A->B to %d, round %d\n", rank, peerSendRank, step);
                 if(!is_capturing) {
-                    right_a.put(0, size*2);
+                    //left_a.signal();
+                    //left_a.flush();
+                    //right_a.wait();
+                    right_a.put(0, size*2, 0, 1);
                     right_a.signal();
                 }
             }
         }
+        deviceSyncer.sync(gridDim.x, -1);
+        
 
         // The first comms iteration in the ring is performed during
         // the GEMM operation, so we can start with a reduce here
@@ -55,8 +64,13 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, __half* __rest
             half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
             //const __half2* buff = step % 2 == 0 ? buff_a : buff_b;
             half2_t b = reinterpret_cast<half2_t*>(step % 2 == 0 ? buff_b : buff_a)[i / 2];
+            //half2_t b = reinterpret_cast<half2_t*>(buff_a)[i / 2];
             //half2_t b = reinterpret_cast<const half2_t*>(buff_a)[i / 2];
             reinterpret_cast<half2_t*>(D)[i / 2] = __hadd2(a, b);  // In-place addition
+            //reinterpret_cast<half2_t*>(D)[i / 2] = b;
+            //if (idx == 0) {
+            //    printf("Allreduce Rank %d adding %f, round %d\n", rank, __half2float(b.x), step);
+            //}
         }
 
         // Handle odd-length case (if n is odd)
@@ -70,13 +84,13 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, __half* __rest
             if (step % 2 == 0) {
                 // Let's wait for the parallel transfer to complete (B->A)
                 if(!is_capturing) {
-                    right_b.flush();
+                    //right_b.flush();
                     left_b.wait();
                 }
             } else {
                 // Let's wait for the parallel transfer to complete (A->B)
                 if(!is_capturing) {
-                    right_a.flush();
+                    //right_a.flush();
                     left_a.wait();
                 }
             }
@@ -85,14 +99,17 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, __half* __rest
      }
 }
 
-#define launch_tsr(BL, AP, BP, C, QS)                                                                        \
-    block.x = WARPSIZE * (AP + BP + C); \
-    _tsr_kernel<BL, AP, BP, C, QS><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, split_k, rank, world_size, buff_a_, is_capturing); \
+
+
+#define launch_tsr(BL, AP, BP, C, QS)                                                                                  \
+    block.x = WARPSIZE * (AP + BP + C);                                                                                \
+    _tsr_kernel<BL, AP, BP, C, QS><<<grid, block, 0, stream>>>(A_, B_, D_, scale_tensor_, m, n, k, b_stride, split_k, rank, world_size, buff_a_, is_capturing); \
     break;
 
 template <int B_LANES, int A_PRODUCERS, int B_PRODUCERS, int CONSUMERS, int QSIZE>
 void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B, half* __restrict__ D,
-                            const float* scale_tensor, const int m, const int n, const int k, const int split_k, const int rank, const int world_size, half* scratch, bool is_capturing) {
+                            const float* scale_tensor, const int m, const int n, const int k, const int b_stride,
+                            const int split_k, const int rank, const int world_size, half* scratch, bool is_capturing) {
     // Initialize shared queue
     __shared__ int queue[2 * B_LANES * QSIZE];
     if (threadIdx.x < 2 * B_LANES * QSIZE) {
@@ -132,8 +149,8 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
     int peerRecvRank = (rank - 1 + world_size) % world_size;
     int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
     int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
-    DeviceHandle<mscclpp::PortChannel>& left = constRingChannelsA[peerRecvId];
-    DeviceHandle<mscclpp::PortChannel>& right = constRingChannelsA[peerSendId];
+    DeviceHandle<mscclpp::MemoryChannel>& left = constRingChannelsA[peerRecvId];
+    DeviceHandle<mscclpp::MemoryChannel>& right = constRingChannelsA[peerSendId];
 
     // Tiles loop
     int curr_n, curr_k, k_blocks, dropped_rows, dropped_cols;
@@ -158,28 +175,17 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
         if (threadIdx.x < A_PRODUCERS * WARPSIZE) {
             _tsr_A_producer<A_PRODUCERS, B_LANES, QSIZE>(A + curr_k, &A_buffer[0], &queue[0], index, p_state, role_id,
                                                          dropped_rows, k, k_blocks);
-            __syncthreads();
         }
         // B producer warp
         else if (threadIdx.x < A_PRODUCERS * WARPSIZE + B_PRODUCERS * WARPSIZE) {
-            _tsr_B_producer<B_PRODUCERS, B_LANES, QSIZE>(B + curr_n * k + curr_k, &B_buffer[0], &queue[1], index,
-                                                         p_state, role_id, k, k_blocks);
-            __syncthreads();
+            _tsr_B_producer<B_PRODUCERS, B_LANES, QSIZE>(B + curr_n * b_stride + curr_k, &B_buffer[0], &queue[1], index,
+                                                         p_state, role_id, b_stride, k_blocks);
         }
         // Consumers warp
         else if (threadIdx.x < (A_PRODUCERS + B_PRODUCERS + CONSUMERS) * WARPSIZE) {
             _tsr_consumer<CONSUMERS, B_LANES, QSIZE>(&A_buffer[0], &B_buffer[0], D + curr_n, scale_tensor[0], &queue[0],
                                                      index, p_state, role_id, n, dropped_rows, dropped_cols, k,
-                                                     k_blocks, scratch + curr_n, curr_n);
-            __syncthreads();
-            if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE) {
-                // Send the result around the ring, only one thread needs to do this
-                //printf("Rank %d: Sending data to %d\n", rank, peerSendRank);
-                //for (int row = 0; row < 8 /* 8 rows tile */; row++) {
-                //    right.put(2*(curr_n + row * n), (16*B_LANES) * 2);
-                //}
-                //printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
-            }
+                                                     k_blocks, scratch + curr_n);
         }
     }
     deviceSyncer.sync(gridDim.x, -1);
@@ -187,9 +193,9 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
         // Send the result around the ring, only one thread needs to do this.
 
         if(!is_capturing) {
-            right.put(0, m*n*2);
+            right.put(0, m*n*2, 0, 1);
             right.signal();
-            right.flush();
+            //right.flush();
             left.wait();
         }
         //printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
@@ -202,6 +208,7 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     const int m = A.size(0);
     const int n = B.size(1);
     const int k = A.size(1);
+    const int b_stride = B.stride(1);
 
     const fp8* __restrict__ A_ = (const fp8* __restrict__)A.data_ptr();
     const fp8* __restrict__ B_ = (const fp8* __restrict__)B.data_ptr();
@@ -225,22 +232,9 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
     dim3 grid(CU, 1, 1);
     dim3 block(1, 1, 1);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
-    const cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Launch kernel (branched on B_LANES)
-    //cudaEventSynchronize(lock);
-
-    cudaStreamCaptureStatus status;
-    cudaError_t err = cudaStreamIsCapturing(stream, &status);
-    if (err != cudaSuccess) {
-        printf("Error from cudaStreamIsCapturing: %s\n", cudaGetErrorString(err));
-    }
-    //bool is_capturing = (status != hipStreamCaptureStatusNone);
-
-    //printf("capturing state: %d\n", status);
-    //printf("current stream: %p\n", stream);
-    //printf("capturing: %d\n", is_capturing);
-
     switch (b_lanes) {
         case 2:
             launch_tsr(2, 3, 8, 4, 5);
@@ -254,11 +248,7 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
             break;
     }
 
-    int threads = 256;
+    int threads = 1024;
     int blocks = (D.numel() / 2 + threads - 1) / threads;
-    //printf("Allreduce: sizes: %d %d %d %d %d %d\n", D.numel(), m, n, k, m*n, m*n*2);
     vectorized_reduce_inplace<<<blocks, threads, 0, stream>>>(D_, buff_a_, buff_b_, D.numel(), rank, world_size, is_capturing);
-    //cudaEventRecord(lock, stream);
-    //cudaStreamSynchronize(stream);
-    //cudaDeviceSynchronize();
 }
