@@ -7,7 +7,7 @@ import mscclpp_allreduce
 import os
 
 import torch.distributed as dist
-#from hf_rocm_kernels import skinny_gemm
+from hf_rocm_kernels import skinny_gemm
 
 import timeit
 
@@ -21,7 +21,13 @@ def skinny_gemm_and_ar_pytorch(a, b, d, scale):
                 split_k=9,
                 b_lanes=5,
             )
+    torch.cuda.synchronize()
     dist.all_reduce(d, op=dist.ReduceOp.SUM)
+    torch.cuda.synchronize()
+    
+def fused_allreduce(engine, skinny_a, b, out, scale_tensor, split_k, b_lanes, capturing):
+    engine.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes, capturing)
+    torch.cuda.synchronize()
 
 def init_process(rank, world_size, master_addr):
     """Initialize process group and set environment variables"""
@@ -94,7 +100,43 @@ def generate_skinny_gemm_data(
     output = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
     return skinny_a, b, scale_tensor, output
 
+def generate_random_skinny_gemm_data(
+    m: int, n: int, k: int, seed: Optional[int] = None
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Generates random inputs for the skinny_gemm operation. The generated input's shape is determined by (m), (n) and
+    (k), and one can pass a (seed) to ensure repeatability."""
+    if seed is not None:
+        torch.manual_seed(seed)
+    scale_tensor = torch.rand(size=(1,), device="cuda", dtype=torch.float32).mul(2).add(1)
+    skinny_a = fp8_quantize(
+        torch.normal(0, 1, size=(m, k), device="cuda", dtype=torch.float32),
+        scale_tensor,
+    )[0]
+    b = fp8_quantize(
+        torch.normal(0, 1, size=(n, k), device="cuda", dtype=torch.float32),
+        scale_tensor,
+    )[0].t()
+    output = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
+    return skinny_a, b, scale_tensor, output
+
 from time import sleep
+
+def create_index_tensor(m, n):
+    """
+    Creates an (m, n) tensor on CUDA with float16 dtype where each element is its index.
+    
+    Args:
+        m (int): Number of rows
+        n (int): Number of columns
+        
+    Returns:
+        torch.Tensor: Tensor of shape (m, n) with index values, float16, on CUDA
+    """
+    # Create on CUDA with float16 dtype
+    indices = torch.arange(m * n, dtype=torch.float16, device='cuda')
+    
+    # Reshape to (m, n)
+    return indices.view(m, n)
 
 def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: int, b_lanes: int):
     """Test for the skinny_gemm operation."""
@@ -106,16 +148,57 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
         skinny_a, b, scale_tensor, out = generate_skinny_gemm_data(m, n, k, seed=0)
         skinny_a2, b2, scale_tensor2, out2 = generate_skinny_gemm_data(m, n, k, seed=0)
 
-        print("out_size: ", out.shape)
+        #print("out_size: ", out.shape)
 
         # Create AllReduce instance
         comms_a = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
+        #comms_a.copy_
         comms_b = torch.zeros(size=(m, n), dtype=torch.float16, device="cuda")
         allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size, 50004, comms_a, comms_b)
+        
+        #print("comms_a", comms_a.int())
 
         # Perform reduction
-        allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes, False)
-        #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
+        #allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes, False)
+        #skinny_gemm(
+        #        skinny_a=skinny_a,
+        #        b=b,
+        #        scale_tensor=scale_tensor,
+        #        output=out,
+        #        split_k=9,
+        #        b_lanes=5,
+        #    )
+        #out1 = out.clone()
+        #out2 = out.clone()
+        #comms_a.copy_(out)
+        #skinny_gemm_and_ar_pytorch(skinny_a, b, out1, scale_tensor)
+        #allreduce.reduce(skinny_a, b, out1, scale_tensor, split_k, b_lanes, False)
+        #comms_a.fill_(0)
+        #comms_b.fill_(0)
+        #allreduce.reduce(skinny_a, b, out2, scale_tensor, split_k, b_lanes, False)
+        #skinny_gemm_and_ar_pytorch(skinny_a, b, out2, scale_tensor)
+        #print("out1", out1)
+        #print("out2", out2)
+        
+        
+        #torch.testing.assert_close(out1, out2, 
+        #                        rtol=1e-3, atol=1e-2)
+        
+        # out3 = out.clone()
+        # out4 = out.clone()
+        # comms_a.copy_(out)
+        # out4.copy_(out)
+        # comms_b.fill_(0)
+        # comms_a.copy_(out)
+        # #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
+        # allreduce.reduce(skinny_a, b, out3, scale_tensor, split_k, b_lanes, False)
+        # skinny_gemm_and_ar_pytorch(skinny_a, b, out4, scale_tensor)
+        # print("out3", out3)
+        # print("out4", out4)
+        # torch.testing.assert_close(out3, out4, 
+        #                         rtol=1e-3, atol=1e-2)
+        
+        #dist.all_reduce(comms_a, op=dist.ReduceOp.SUM)
 
         #start_torch = torch.cuda.Event(enable_timing=True)
         #end_torch = torch.cuda.Event(enable_timing=True)
@@ -124,27 +207,71 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
         #torch.cuda.synchronize()
 
         #start_fused.record()
-        #fused = timeit.timeit(lambda: allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes), number=1)
-        #allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes)
+        #fused = timeit.timeit(lambda: allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes, False), number=10)
+        allreduce.reduce(skinny_a, b, out, scale_tensor, split_k, b_lanes, False)
         #end_fused.record()
         #torch.cuda.synchronize()
         #start_torch.record()
-        #torch = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=1)
+        #pytorch = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=10)
         #skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor)
         #end_torch.record()
 
         #print(f"Fused: {fused} \n")
-        #print(f"Pytorch: {torch} \n")
+        #print(f"Pytorch: {pytorch} \n")
+        
+        #fused2 = timeit.timeit(lambda: fused_allreduce(allreduce, skinny_a, b, out, scale_tensor, split_k, b_lanes, False), number=10)
+        #pytorch2 = timeit.timeit(lambda: skinny_gemm_and_ar_pytorch(skinny_a, b, out, scale_tensor), number=10)
+
+
+        #print(f"Fused2: {fused2} \n")
+        #print(f"Pytorch2: {pytorch2} \n")
         #print(f"Fused: {start_fused.elapsed_time(end_fused)} \n")
         #print(f"Pytorch: {start_torch.elapsed_time(end_torch)} \n")
         #torch.set_printoptions(profile="full")
         print("out", out)
-        print("comms_a", comms_a)
-        print("comms_b", comms_b)
+        #print("comms_a", comms_a)
+        #print("comms_b", comms_b)
 
-        allreduce.reduce(skinny_a2, b2, out2, scale_tensor2, split_k, b_lanes, False)
-        print("out2", out2)
-
+        #allreduce.reduce(skinny_a2, b2, out2, scale_tensor2, split_k, b_lanes, False)
+        #print("out2", out2)
+        #torch.set_printoptions(profile="full") 
+        #shape = (8, 16384)
+        
+        #rank = dist.get_rank()
+        #torch.manual_seed(42 + rank)  # Different seed per rank
+        #tensor = torch.randn(*shape, dtype=torch.float16, device="cuda") #* (rank + 1)
+        #if (rank == 1):
+        #    tensor = torch.ones(*shape, dtype=torch.float16, device="cuda")
+        #else:
+        #    tensor = torch.ones (*shape, dtype=torch.float16, device="cuda") * rank
+            
+        #tensor = torch.ones (*shape, dtype=torch.float16, device="cuda") * rank
+        
+        #tensor = torch.ones(*shape, dtype=torch.float16, device="cuda")
+        
+        #comms_a = torch.zeros(size=shape, dtype=torch.float16, device="cuda")
+        #comms_a.copy_(tensor)
+        #comms_b = torch.zeros(size=shape, dtype=torch.float16, device="cuda")
+        
+        #print("rank:", rank, "comms_b", comms_b)
+        #print("comms_b", comms_b)
+        #allreduce = mscclpp_allreduce.AllReduceEngine(rank, world_size, 50004, comms_a, comms_b)
+        #custom_result = tensor.clone()
+        #comms_b.copy_(torch.ones (*shape, dtype=torch.float16, device="cuda") * ((rank + 8 - 1) % 8))
+        #allreduce.reduce(skinny_a, b, custom_result, scale_tensor, split_k, b_lanes, False)
+        #torch.cuda.synchronize()
+        
+        # PyTorch allreduce
+        #torch_result = tensor.clone()
+        #dist.all_reduce(torch_result)
+        
+        #print("pytorch_result", torch_result)
+        #print("custom_result", custom_result)
+        #print("comms_a", comms_a)
+        #print("comms_b", comms_b)
+        
+        #torch.testing.assert_close(custom_result, torch_result, 
+        #                        rtol=1e-5, atol=1e-5)
     except Exception as e:
         print(f"Error on rank {rank}: {str(e)}")
         raise
@@ -154,10 +281,10 @@ def _benchmark_skinny_gemm(rank, world_size, m: int, n: int, k: int, split_k: in
 def test_process():
     M = 8
     #N = 13312
-    N = 16384
-    K = 16384
-    #N = 16
-    #K = 256
+    N = 32768
+    K = 32768
+    #N = 256
+    #K = 512
     B_LANES = 5
     SPLIT_K = 3
 

@@ -14,7 +14,8 @@ setup(
         libraries=['mscclpp', 'mpi'],
         #extra_compile_args=['-Xarch_gfx942'],
         extra_cuda_cflags=['-arch=gfx942'],
-        extra_hip_cflags=['-arch=gfx942']
+        extra_hip_cflags=['-arch=gfx942'],
+        extra_compile_args=['--offload-arch=gfx942', '-U__HIP_NO_HALF_CONVERSIONS__', '-U__HIP_NO_HALF_OPERATORS__']
         )
     ],
     cmdclass={

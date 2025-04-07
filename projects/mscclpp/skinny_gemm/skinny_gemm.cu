@@ -12,91 +12,78 @@ __constant__ DeviceHandle<mscclpp::MemoryChannel> constRingChannelsB[7];
 __device__ mscclpp::DeviceSyncer deviceSyncer;
 
 __global__ void vectorized_reduce_inplace(__half* __restrict__ D, __half* __restrict__ buff_a, __half* __restrict__ buff_b, int size, int rank, int world_size, bool is_capturing) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    int stride = gridDim.x * blockDim.x;
     using half2_t = __half2;
-
-
-    // Figure out peer channels for comms
-    int peerSendRank = (rank + 1) % world_size;
-    int peerRecvRank = (rank - 1 + world_size) % world_size;
-    int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
-    int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
-
-    DeviceHandle<mscclpp::MemoryChannel>& left_a = constRingChannelsA[peerRecvId];
-    DeviceHandle<mscclpp::MemoryChannel>& right_a = constRingChannelsA[peerSendId];
-
-    DeviceHandle<mscclpp::MemoryChannel>& left_b = constRingChannelsB[peerRecvId];
-    DeviceHandle<mscclpp::MemoryChannel>& right_b = constRingChannelsB[peerSendId];
-
+    
+    // Separate communication and compute blocks
+    bool is_comm_block = (blockIdx.x == gridDim.x - 1);  // Last block handles communication
+    bool is_compute_block = !is_comm_block;
+    
     // Ring all-reduce
-    for (int step = 0; step < world_size - 1; ++step) {
-        if (idx == 0) {
-            if (step % 2 == 0) {
-                // Let's wait for the parallel transfer to complete (B->A)
-                //printf("Allreduce Rank %d: Sending data B->A to %d, round %d\n", rank, peerSendRank, step);
-                if(!is_capturing) {
-                    //left_b.signal();
-                    //left_b.flush();
-                    //right_b.wait();
-                    //right_b.put(0, size*2);
-                    right_b.put(0, size*2, 0, 1);
-                    right_b.signal();
-                }
-            } else {
-                // Let's wait for the parallel transfer to complete (A->B)
-                //printf("Allreduce Rank %d: Sending data A->B to %d, round %d\n", rank, peerSendRank, step);
-                if(!is_capturing) {
-                    //left_a.signal();
-                    //left_a.flush();
-                    //right_a.wait();
-                    right_a.put(0, size*2, 0, 1);
-                    right_a.signal();
-                }
+    for (int step = 0; step < world_size - 1; ++step) { 
+        if (is_compute_block) {
+            int idx = threadIdx.x + blockIdx.x * blockDim.x;
+            int stride = (gridDim.x - 1) * blockDim.x;  // Only compute blocks contribute to stride
+            
+            // The first comms iteration in the ring is performed during
+            // the GEMM operation, so we can start with a reduce here
+            for (int i = idx * 2; i < size; i += stride * 2) {
+                half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
+                half2_t b = reinterpret_cast<half2_t*>(step % 2 == 0 ? buff_b : buff_a)[i / 2];
+                reinterpret_cast<half2_t*>(D)[i / 2] = __hadd2(a, b);  // In-place addition
             }
-        }
-        deviceSyncer.sync(gridDim.x, -1);
-        
 
-        // The first comms iteration in the ring is performed during
-        // the GEMM operation, so we can start with a reduce here
-        for (int i = idx * 2; i < size; i += stride * 2) {
-            half2_t a = reinterpret_cast<half2_t*>(D)[i / 2];
-            //const __half2* buff = step % 2 == 0 ? buff_a : buff_b;
-            half2_t b = reinterpret_cast<half2_t*>(step % 2 == 0 ? buff_b : buff_a)[i / 2];
-            //half2_t b = reinterpret_cast<half2_t*>(buff_a)[i / 2];
-            //half2_t b = reinterpret_cast<const half2_t*>(buff_a)[i / 2];
-            reinterpret_cast<half2_t*>(D)[i / 2] = __hadd2(a, b);  // In-place addition
-            //reinterpret_cast<half2_t*>(D)[i / 2] = b;
-            //if (idx == 0) {
-            //    printf("Allreduce Rank %d adding %f, round %d\n", rank, __half2float(b.x), step);
-            //}
-        }
+            // Handle odd-length case (if n is odd)
+            if (idx == 0 && (size % 2) != 0) {
+                __half b = (step % 2 == 0 ? buff_b : buff_a)[size - 1];
+                D[size - 1] = __hadd(D[size - 1], b);
+            }
 
-        // Handle odd-length case (if n is odd)
-        if (idx == 0 && (size % 2) != 0) {
-            __half b = (step % 2 == 0 ? buff_b : buff_a)[size - 1];
-            D[size - 1] = __hadd(D[size - 1], b);
-        }
+        } else if (is_comm_block && !is_capturing) {
+            // Communication block handles all the data transfer
+            int comm_threads = blockDim.x;
+            int comm_thread_id = threadIdx.x;
 
-        deviceSyncer.sync(gridDim.x, -1);
-        if (idx == 0) {
+            int elements_per_thread = ((size + 1) / 2 + comm_threads - 1) / comm_threads;
+            int start_idx = comm_thread_id * elements_per_thread;
+            int end_idx = min(start_idx + elements_per_thread, (size + 1) / 2);
+            uint64_t offset_bytes = start_idx * sizeof(half2_t);
+            uint64_t chunk_bytes = (end_idx - start_idx) * sizeof(half2_t);
+
+            // Figure out peer channels for comms
+            int peerSendRank = (rank + 1) % world_size;
+            int peerRecvRank = (rank - 1 + world_size) % world_size;
+            int peerSendId = peerSendRank < rank ? peerSendRank : peerSendRank - 1;
+            int peerRecvId = peerRecvRank < rank ? peerRecvRank : peerRecvRank - 1;
+
+            DeviceHandle<mscclpp::MemoryChannel>& left_a = constRingChannelsA[peerRecvId];
+            DeviceHandle<mscclpp::MemoryChannel>& right_a = constRingChannelsA[peerSendId];
+            DeviceHandle<mscclpp::MemoryChannel>& left_b = constRingChannelsB[peerRecvId];
+            DeviceHandle<mscclpp::MemoryChannel>& right_b = constRingChannelsB[peerSendId];
+
             if (step % 2 == 0) {
-                // Let's wait for the parallel transfer to complete (B->A)
-                if(!is_capturing) {
-                    //right_b.flush();
+                // B->A transfer
+                right_b.put(offset_bytes, chunk_bytes, comm_thread_id, comm_threads);
+                if (comm_thread_id == 0) {
+                    right_b.signal();
                     left_b.wait();
                 }
+                __syncthreads();
+                
+                //deviceSyncer.sync(gridDim.x, -1);
             } else {
-                // Let's wait for the parallel transfer to complete (A->B)
-                if(!is_capturing) {
-                    //right_a.flush();
+                // A->B transfer
+                right_a.put(offset_bytes, chunk_bytes, comm_thread_id, comm_threads);
+                if (comm_thread_id == 0) {
+                    right_a.signal();
                     left_a.wait();
                 }
+                __syncthreads();
+                
+                //deviceSyncer.sync(gridDim.x, -1);
             }
         }
         deviceSyncer.sync(gridDim.x, -1);
-     }
+    }
 }
 
 
@@ -188,19 +175,19 @@ void __global__ _tsr_kernel(const fp8* __restrict__ A, const fp8* __restrict__ B
                                                      k_blocks, scratch + curr_n);
         }
     }
-    deviceSyncer.sync(gridDim.x, -1);
-    if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE && blockIdx.x == 0) {
-        // Send the result around the ring, only one thread needs to do this.
+    // deviceSyncer.sync(gridDim.x, -1);
+    // if (threadIdx.x == (A_PRODUCERS + B_PRODUCERS) * WARPSIZE && blockIdx.x == 0) {
+    //     // Send the result around the ring, only one thread needs to do this.
 
-        if(!is_capturing) {
-            right.put(0, m*n*2, 0, 1);
-            right.signal();
-            //right.flush();
-            left.wait();
-        }
-        //printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
-    }
-    deviceSyncer.sync(gridDim.x, -1);
+    //     if(!is_capturing) {
+    //         right.put(0, m*n*2, 0, 1);
+    //         right.signal();
+    //         //right.flush();
+    //         left.wait();
+    //     }
+    //     //printf("Rank %d: Received data from %d\n", rank, peerRecvRank);
+    // }
+    // deviceSyncer.sync(gridDim.x, -1);
 }
 
 void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Tensor& scale_tensor, int64_t b_lanes,
@@ -250,5 +237,5 @@ void skinny_gemm(torch::Tensor& A, torch::Tensor& B, torch::Tensor& D, torch::Te
 
     int threads = 1024;
     int blocks = (D.numel() / 2 + threads - 1) / threads;
-    vectorized_reduce_inplace<<<blocks, threads, 0, stream>>>(D_, buff_a_, buff_b_, D.numel(), rank, world_size, is_capturing);
+    vectorized_reduce_inplace<<<blocks + 1, threads, 0, stream>>>(D_, buff_a_, buff_b_, D.numel(), rank, world_size, is_capturing);
 }
