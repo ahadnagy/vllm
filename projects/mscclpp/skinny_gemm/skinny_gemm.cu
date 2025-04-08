@@ -82,7 +82,7 @@ __global__ void vectorized_reduce_inplace(__half* __restrict__ D, __half* __rest
                 //deviceSyncer.sync(gridDim.x, -1);
             }
         }
-        deviceSyncer.sync(gridDim.x, -1);
+        //deviceSyncer.sync(gridDim.x, -1);
     }
 }
 
